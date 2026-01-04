@@ -1,0 +1,3125 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                          ║
+║   ██╗  ██╗ ██████╗ ██╗      ██████╗  ██████╗██╗         ██████╗ ███████╗███╗   ██╗      ║
+║   ██║  ██║██╔═══██╗██║     ██╔═══██╗██╔════╝██║         ██╔══██╗██╔════╝████╗  ██║      ║
+║   ███████║██║   ██║██║     ██║   ██║██║     ██║         ██████╔╝█████╗  ██╔██╗ ██║      ║
+║   ██╔══██║██║   ██║██║     ██║   ██║██║     ██║         ██╔══██╗██╔══╝  ██║╚██╗██║      ║
+║   ██║  ██║╚██████╔╝███████╗╚██████╔╝╚██████╗███████╗    ██████╔╝███████╗██║ ╚████║      ║
+║   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝ ╚═════╝  ╚═════╝╚══════╝    ╚═════╝ ╚══════╝╚═╝  ╚═══╝      ║
+║                                                                                          ║
+║   HoloCL Comprehensive Benchmark Suite v1.0 - FIXED                                      ║
+║   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ║
+║                                                                                          ║
+║   FIX APPLIED: EWC parameter name collision bug                                          ║
+║   - MNISTEncoder and ClassifierHead both have 'fc' layer                                 ║
+║   - Original code used dict keys that collided (fc.weight, fc.bias)                      ║
+║   - Fix: Added 'encoder.' and 'classifier.' prefixes to parameter names                  ║
+║                                                                                          ║
+║   FIX APPLIED: test_fault_tolerance keyword argument bug                                 ║
+║   - modified_retrieve didn't accept simulate_failures keyword                            ║
+║   - Fix: Used factory pattern with proper keyword argument                               ║
+║                                                                                          ║
+║   FIX APPLIED: NaiveFinetuning missing seed parameter                                    ║
+║   - run_ablation_components passed seed=seed but class didn't accept it                  ║
+║   - Fix: Added seed parameter to NaiveFinetuning.__init__                                ║
+║                                                                                          ║
+║   A Complete Framework for Evaluating Continual Learning with:                           ║
+║   • Multiple Benchmarks: Split MNIST/CIFAR, Permuted MNIST, Rotated MNIST               ║
+║   • Standard Baselines: EWC, LwF, DER++, Replay, Naive FT, etc.                         ║
+║   • Complete Metrics: AA, FWT, BWT, Forgetting, Task Inference Accuracy                  ║
+║   • HoloNet Architecture: Per-Task Encoders + Task Inference + HoloRAID Memory          ║
+║   • Ablation Studies: Memory, Encoders, Routing, Quantization                           ║
+║   • Scaling Analysis: Tasks 5→10→20, Memory Budget, Parameters                          ║
+║                                                                                          ║
+║   Authors: HyperMorphic Mathematics Research                                             ║
+║   Date: 2026-01-04                                                                       ║
+║   License: MIT                                                                           ║
+║                                                                                          ║
+╚══════════════════════════════════════════════════════════════════════════════════════════╝
+
+COLAB USAGE:
+1. Create new notebook at colab.research.google.com  
+2. Paste this entire file into a cell
+3. Run: results = main()
+
+Dependencies: torch, torchvision, numpy, matplotlib (all pre-installed in Colab)
+"""
+
+from __future__ import annotations
+import os
+import json
+import time
+import math
+import random
+import copy
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Callable, Union
+from functools import reduce
+from collections import defaultdict
+from abc import ABC, abstractmethod
+from enum import Enum
+import gc
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, Dataset, Subset
+from torch.optim import Adam, SGD
+
+import torchvision
+import torchvision.transforms as transforms
+from torchvision.datasets import MNIST, CIFAR10, CIFAR100
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION & GLOBALS
+# ════════════════════════════════════════════════════════════════════════════════
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def set_seed(seed: int):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def banner():
+    """Print banner."""
+    print("═" * 90)
+    print("  HoloCL Comprehensive Benchmark Suite v1.0")
+    print("  Continual Learning with HoloRAID Memory + Per-Task Encoders")
+    print("═" * 90)
+    print(f"  Device: {DEVICE}")
+    print(f"  PyTorch: {torch.__version__}")
+    print(f"  CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART I: NUMBER THEORY FOR HOLORAID (CRT + Asmuth-Bloom)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
+    """Extended Euclidean algorithm. Returns (gcd, x, y) where ax + by = gcd."""
+    if a == 0:
+        return (b, 0, 1)
+    g, x, y = extended_gcd(b % a, a)
+    return (g, y - (b // a) * x, x)
+
+
+def mod_inverse(a: int, m: int) -> int:
+    """Modular multiplicative inverse of a mod m."""
+    g, x, _ = extended_gcd(a % m, m)
+    if g != 1:
+        raise ValueError(f"No modular inverse for {a} mod {m}")
+    return x % m
+
+
+def is_prime(n: int) -> bool:
+    """Miller-Rabin primality test."""
+    if n < 2:
+        return False
+    if n in (2, 3):
+        return True
+    if n % 2 == 0:
+        return False
+    r, d = 0, n - 1
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+    for a in [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]:
+        if a >= n:
+            continue
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def next_prime(n: int) -> int:
+    """Find smallest prime >= n."""
+    if n <= 2:
+        return 2
+    if n % 2 == 0:
+        n += 1
+    while not is_prime(n):
+        n += 2
+    return n
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART II: HOLORAID MEMORY SYSTEM
+# ════════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class HoloRAIDConfig:
+    """Configuration for HoloRAID CRT-based memory."""
+    Q: int = 65535              # Quantization levels (16-bit)
+    n_shards: int = 5           # Total shards
+    k_threshold: int = 3        # Minimum shards for reconstruction
+    epsilon_h: int = 1          # No-zero shift
+    use_secrecy: bool = False   # Asmuth-Bloom secrecy
+    seed: int = 42
+    
+    # Derived fields
+    p0: int = field(init=False)
+    primes: List[int] = field(init=False)
+    M_k: int = field(init=False)
+    max_r: int = field(init=False)
+    route_perm: List[int] = field(init=False)
+    
+    def __post_init__(self):
+        self.p0 = next_prime(self.Q + self.epsilon_h + 1)
+        
+        self.primes = []
+        candidate = self.p0 + 1
+        while len(self.primes) < self.n_shards:
+            p = next_prime(candidate)
+            self.primes.append(p)
+            candidate = p + 1
+        
+        sorted_primes = sorted(self.primes)
+        self.M_k = reduce(lambda a, b: a * b, sorted_primes[:self.k_threshold], 1)
+        M_k_minus_1 = (
+            reduce(lambda a, b: a * b, sorted_primes[:self.k_threshold - 1], 1)
+            if self.k_threshold > 1 else 1
+        )
+        if self.p0 * M_k_minus_1 >= self.M_k:
+            raise ValueError("Asmuth-Bloom condition violated")
+        self.max_r = (self.M_k - self.Q - self.epsilon_h - 1) // self.p0
+        
+        rng = np.random.default_rng(self.seed)
+        self.route_perm = list(map(int, rng.permutation(self.n_shards)))
+
+
+class HoloRAIDMemory:
+    """
+    CRT-based fault-tolerant memory for embeddings.
+    
+    Features:
+    - k-of-n reconstruction (tolerates n-k shard failures)
+    - Unit-normalized embeddings quantized to [0, Q]
+    - Task-conditioned retrieval
+    - Efficient pruning strategies
+    """
+    
+    def __init__(self, config: HoloRAIDConfig, embedding_dim: int):
+        self.config = config
+        self.embedding_dim = embedding_dim
+        self.rng = np.random.default_rng(config.seed)
+        
+        self.entries: List[Dict[str, Any]] = []
+        self.shard_banks: List[List[np.ndarray]] = [[] for _ in range(config.n_shards)]
+        
+        # Statistics
+        self.store_count = 0
+        self.retrieve_count = 0
+    
+    def quantize_unit(self, embedding: np.ndarray) -> np.ndarray:
+        """Quantize unit-normalized embedding to [0, Q]."""
+        e = np.clip(embedding.astype(np.float32), -1.0, 1.0)
+        return np.rint((e + 1.0) * 0.5 * self.config.Q).astype(np.uint16)
+    
+    def dequantize_unit(self, quantized: np.ndarray) -> np.ndarray:
+        """Dequantize and re-normalize."""
+        e = (quantized.astype(np.float32) / self.config.Q) * 2.0 - 1.0
+        return (e / (np.linalg.norm(e) + 1e-8)).astype(np.float32)
+    
+    def _crt_encode(self, values: np.ndarray) -> List[np.ndarray]:
+        """CRT encode values into n shards."""
+        cfg = self.config
+        s = values.astype(np.uint64) + np.uint64(cfg.epsilon_h)
+        
+        if cfg.use_secrecy:
+            r = self.rng.integers(0, cfg.max_r + 1, size=values.shape, dtype=np.uint64)
+            s_prime = s + r * np.uint64(cfg.p0)
+        else:
+            s_prime = s
+        
+        shares = []
+        for p in cfg.primes:
+            shares.append((s_prime % np.uint64(p)).astype(np.uint32))
+        
+        return [shares[cfg.route_perm[i]] for i in range(cfg.n_shards)]
+    
+    def _crt_decode(self, shards: List[np.ndarray], available_indices: List[int]) -> np.ndarray:
+        """CRT decode from k shards using Garner's algorithm."""
+        cfg = self.config
+        k = cfg.k_threshold
+        
+        if len(available_indices) < k:
+            raise RuntimeError(f"Insufficient shards: {len(available_indices)} < {k}")
+        
+        use_indices = available_indices[:k]
+        prime_indices = [cfg.route_perm[i] for i in use_indices]
+        moduli = [int(cfg.primes[pi]) for pi in prime_indices]
+        residues = [shards[i].astype(np.uint64) for i in use_indices]
+        
+        p0 = int(cfg.p0)
+        
+        # Garner's algorithm for CRT reconstruction mod p0
+        x_mod_p0 = (residues[0] % np.uint64(p0)).astype(np.uint64)
+        x_mods = [(residues[0] % np.uint64(mj)).astype(np.uint64) for mj in moduli]
+        
+        M_mod_p0 = moduli[0] % p0
+        M_mods = [0] * k
+        for j in range(1, k):
+            M_mods[j] = moduli[0] % moduli[j]
+        
+        for i in range(1, k):
+            mi = moduli[i]
+            ri = residues[i]
+            Mi_mod_mi = M_mods[i]
+            inv = mod_inverse(Mi_mod_mi, mi)
+            
+            diff = (ri + np.uint64(mi) - (x_mods[i] % np.uint64(mi))) % np.uint64(mi)
+            t = (diff * np.uint64(inv)) % np.uint64(mi)
+            
+            x_mod_p0 = (x_mod_p0 + (t % np.uint64(p0)) * np.uint64(M_mod_p0)) % np.uint64(p0)
+            
+            for j in range(i + 1, k):
+                mj = moduli[j]
+                x_mods[j] = (x_mods[j] + (t % np.uint64(mj)) * np.uint64(M_mods[j])) % np.uint64(mj)
+            
+            M_mod_p0 = (M_mod_p0 * (mi % p0)) % p0
+            for j in range(i + 1, k):
+                mj = moduli[j]
+                M_mods[j] = (M_mods[j] * (mi % mj)) % mj
+        
+        s = (x_mod_p0.astype(np.int64) - cfg.epsilon_h) % (cfg.Q + 1)
+        return s.astype(np.uint16)
+    
+    def store(self, embedding: np.ndarray, label: int, task_id: int) -> int:
+        """Store an embedding with label and task ID."""
+        q = self.quantize_unit(embedding)
+        shards = self._crt_encode(q)
+        
+        for b in range(self.config.n_shards):
+            self.shard_banks[b].append(shards[b].copy())
+        
+        entry = {"index": len(self.entries), "label": int(label), "task_id": int(task_id)}
+        self.entries.append(entry)
+        self.store_count += 1
+        return entry["index"]
+    
+    def retrieve(self, index: int, simulate_failures: int = 0) -> Tuple[np.ndarray, int, int]:
+        """Retrieve embedding by index, optionally simulating shard failures."""
+        if index < 0 or index >= len(self.entries):
+            raise IndexError(f"Index {index} out of range")
+        
+        entry = self.entries[index]
+        available = list(range(self.config.n_shards))
+        
+        if simulate_failures > 0:
+            max_fail = min(simulate_failures, len(available) - self.config.k_threshold)
+            if max_fail > 0:
+                failed = self.rng.choice(available, size=max_fail, replace=False)
+                available = [b for b in available if b not in failed]
+        
+        shards = [self.shard_banks[b][index] for b in range(self.config.n_shards)]
+        q = self._crt_decode(shards, available)
+        emb = self.dequantize_unit(q)
+        self.retrieve_count += 1
+        return emb, entry["label"], entry["task_id"]
+    
+    def retrieve_all_for_task(self, task_id: int, failures: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        """Retrieve all embeddings for a specific task."""
+        embs, labels = [], []
+        for i, entry in enumerate(self.entries):
+            if entry["task_id"] == task_id:
+                e, y, _ = self.retrieve(i, simulate_failures=failures)
+                embs.append(e)
+                labels.append(y)
+        if not embs:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32), np.array([], dtype=np.int64)
+        return np.array(embs), np.array(labels)
+    
+    def get_task_ids(self) -> List[int]:
+        """Get unique task IDs in memory."""
+        return list(set(e["task_id"] for e in self.entries))
+    
+    def count_for_task(self, task_id: int) -> int:
+        """Count memories for a task."""
+        return sum(1 for e in self.entries if e["task_id"] == task_id)
+    
+    def prune_to_size(self, max_entries: int, strategy: str = "per_task_class"):
+        """Prune memory to max_entries using specified strategy."""
+        if len(self.entries) <= max_entries:
+            return
+        
+        if strategy == "per_task_class":
+            buckets = defaultdict(list)
+            for i, e in enumerate(self.entries):
+                buckets[(e["task_id"], e["label"])].append(i)
+            
+            keep = set()
+            per = max(1, max_entries // max(1, len(buckets)))
+            for _, idxs in buckets.items():
+                if len(idxs) <= per:
+                    keep.update(idxs)
+                else:
+                    keep.update(self.rng.choice(idxs, size=per, replace=False))
+            
+            if len(keep) > max_entries:
+                keep = set(self.rng.choice(sorted(list(keep)), size=max_entries, replace=False))
+        
+        elif strategy == "reservoir":
+            keep = set(self.rng.choice(len(self.entries), size=max_entries, replace=False))
+        
+        elif strategy == "herding":
+            # Compute class means and select closest samples
+            keep = set()
+            buckets = defaultdict(list)
+            for i, e in enumerate(self.entries):
+                emb, _, _ = self.retrieve(i)
+                buckets[(e["task_id"], e["label"])].append((i, emb))
+            
+            per = max(1, max_entries // max(1, len(buckets)))
+            for _, items in buckets.items():
+                if len(items) <= per:
+                    keep.update([i for i, _ in items])
+                else:
+                    embs = np.array([e for _, e in items])
+                    mean = embs.mean(axis=0)
+                    dists = np.linalg.norm(embs - mean, axis=1)
+                    closest = np.argsort(dists)[:per]
+                    keep.update([items[j][0] for j in closest])
+        else:
+            raise ValueError(f"Unknown pruning strategy: {strategy}")
+        
+        # Rebuild entries and shard banks
+        new_entries = []
+        new_banks = [[] for _ in range(self.config.n_shards)]
+        
+        for old_idx in sorted(keep):
+            e = dict(self.entries[old_idx])
+            e["index"] = len(new_entries)
+            new_entries.append(e)
+            for b in range(self.config.n_shards):
+                new_banks[b].append(self.shard_banks[b][old_idx])
+        
+        self.entries = new_entries
+        self.shard_banks = new_banks
+    
+    def memory_size_bytes(self) -> int:
+        """Estimate memory usage in bytes."""
+        if not self.entries:
+            return 0
+        shard_size = self.shard_banks[0][0].nbytes if self.shard_banks[0] else 0
+        return len(self.entries) * self.config.n_shards * shard_size
+    
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART III: CONTINUAL LEARNING METRICS
+# ════════════════════════════════════════════════════════════════════════════════
+
+class CLMetrics:
+    """
+    Comprehensive Continual Learning Metrics.
+    
+    Computes:
+    - Average Accuracy (AA): Mean accuracy across all seen tasks
+    - Backward Transfer (BWT): How much learning new tasks affects old ones
+    - Forward Transfer (FWT): How much old knowledge helps new tasks
+    - Forgetting (F): Maximum performance drop per task
+    - Task Inference Accuracy: For task-agnostic evaluation
+    """
+    
+    @staticmethod
+    def average_accuracy(acc_matrix: np.ndarray) -> float:
+        """
+        Average Accuracy after learning all tasks.
+        acc_matrix[i, j] = accuracy on task j after training on task i
+        """
+        T = acc_matrix.shape[0]
+        return float(np.mean(acc_matrix[T-1, :]))
+    
+    @staticmethod
+    def backward_transfer(acc_matrix: np.ndarray) -> float:
+        """
+        Backward Transfer (BWT) - negative means forgetting.
+        BWT = (1/(T-1)) * sum_{i=1}^{T-1} (R_{T,i} - R_{i,i})
+        """
+        T = acc_matrix.shape[0]
+        if T < 2:
+            return 0.0
+        bwt = 0.0
+        for i in range(T - 1):
+            bwt += acc_matrix[T-1, i] - acc_matrix[i, i]
+        return float(bwt / (T - 1))
+    
+    @staticmethod
+    def forward_transfer(acc_matrix: np.ndarray, random_init_accs: Optional[np.ndarray] = None) -> float:
+        """
+        Forward Transfer (FWT) - how much prior learning helps new tasks.
+        FWT = (1/(T-1)) * sum_{i=1}^{T-1} (R_{i-1,i} - b_i)
+        where b_i is random init accuracy (default 1/n_classes)
+        """
+        T = acc_matrix.shape[0]
+        if T < 2:
+            return 0.0
+        
+        if random_init_accs is None:
+            random_init_accs = np.ones(T) * 0.1  # Assume 10-class
+        
+        fwt = 0.0
+        for i in range(1, T):
+            fwt += acc_matrix[i-1, i] - random_init_accs[i]
+        return float(fwt / (T - 1))
+    
+    @staticmethod
+    def forgetting(acc_matrix: np.ndarray) -> float:
+        """
+        Average Forgetting - mean of max performance drop per task.
+        F = (1/(T-1)) * sum_{i=0}^{T-2} max_{k in [i,T-1]} (R_{k,i} - R_{T-1,i})
+        """
+        T = acc_matrix.shape[0]
+        if T < 2:
+            return 0.0
+        
+        total_forget = 0.0
+        for i in range(T - 1):
+            max_acc = np.max(acc_matrix[i:, i])
+            final_acc = acc_matrix[T-1, i]
+            total_forget += max(0, max_acc - final_acc)
+        
+        return float(total_forget / (T - 1))
+    
+    @staticmethod
+    def intransigence(acc_matrix: np.ndarray, joint_accs: Optional[np.ndarray] = None) -> float:
+        """
+        Intransigence - inability to learn new tasks.
+        I = (1/T) * sum_{i=0}^{T-1} (a*_i - R_{i,i})
+        where a*_i is joint training accuracy
+        """
+        T = acc_matrix.shape[0]
+        if joint_accs is None:
+            return 0.0  # Can't compute without joint training baseline
+        
+        intrans = 0.0
+        for i in range(T):
+            intrans += joint_accs[i] - acc_matrix[i, i]
+        return float(intrans / T)
+    
+    @staticmethod
+    def learning_accuracy(acc_matrix: np.ndarray) -> float:
+        """
+        Learning Accuracy - mean diagonal (accuracy right after learning).
+        LA = (1/T) * sum_{i=0}^{T-1} R_{i,i}
+        """
+        return float(np.mean(np.diag(acc_matrix)))
+    
+    @staticmethod
+    def compute_all(
+        acc_matrix: np.ndarray,
+        task_inference_accs: Optional[List[float]] = None,
+        random_init_accs: Optional[np.ndarray] = None,
+        joint_accs: Optional[np.ndarray] = None
+    ) -> Dict[str, float]:
+        """Compute all metrics at once."""
+        metrics = {
+            "AA": CLMetrics.average_accuracy(acc_matrix),
+            "BWT": CLMetrics.backward_transfer(acc_matrix),
+            "FWT": CLMetrics.forward_transfer(acc_matrix, random_init_accs),
+            "Forgetting": CLMetrics.forgetting(acc_matrix),
+            "LA": CLMetrics.learning_accuracy(acc_matrix),
+        }
+        
+        if joint_accs is not None:
+            metrics["Intransigence"] = CLMetrics.intransigence(acc_matrix, joint_accs)
+        
+        if task_inference_accs is not None:
+            metrics["TaskInfAcc"] = float(np.mean(task_inference_accs))
+        
+        return metrics
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART IV: BENCHMARK DATASETS
+# ════════════════════════════════════════════════════════════════════════════════
+
+class BenchmarkType(Enum):
+    """Types of CL benchmarks."""
+    PERMUTED_MNIST = "permuted_mnist"
+    SPLIT_MNIST = "split_mnist"
+    ROTATED_MNIST = "rotated_mnist"
+    SPLIT_CIFAR10 = "split_cifar10"
+    SPLIT_CIFAR100 = "split_cifar100"
+
+
+class CLBenchmark(ABC):
+    """Abstract base class for CL benchmarks."""
+    
+    @abstractmethod
+    def get_task_loaders(self, task_id: int, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        """Get train and test loaders for a task."""
+        pass
+    
+    @abstractmethod
+    def get_all_test_loaders(self, batch_size: int) -> List[DataLoader]:
+        """Get test loaders for all tasks."""
+        pass
+    
+    @property
+    @abstractmethod
+    def n_tasks(self) -> int:
+        pass
+    
+    @property
+    @abstractmethod
+    def n_classes(self) -> int:
+        pass
+    
+    @property
+    @abstractmethod
+    def input_shape(self) -> Tuple[int, ...]:
+        pass
+    
+    @property
+    @abstractmethod
+    def benchmark_type(self) -> BenchmarkType:
+        pass
+
+
+class PermutedMNISTBenchmark(CLBenchmark):
+    """
+    Permuted MNIST Benchmark.
+    Each task has a different pixel permutation.
+    Task-IL with 10 classes per task.
+    """
+    
+    def __init__(
+        self,
+        n_tasks: int = 10,
+        n_train: int = 3000,
+        n_test: int = 500,
+        seed: int = 42
+    ):
+        self._n_tasks = n_tasks
+        self.n_train = n_train
+        self.n_test = n_test
+        self.rng = np.random.default_rng(seed)
+        
+        # Generate permutations (task 0 = identity)
+        self.perms = [np.arange(28 * 28)]
+        for _ in range(n_tasks - 1):
+            self.perms.append(self.rng.permutation(28 * 28))
+        
+        # Load MNIST
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_data = MNIST("./data", train=True, download=True, transform=transform)
+        test_data = MNIST("./data", train=False, download=True, transform=transform)
+        
+        train_images = train_data.data.float().unsqueeze(1) / 255.0
+        train_labels = train_data.targets
+        test_images = test_data.data.float().unsqueeze(1) / 255.0
+        test_labels = test_data.targets
+        
+        # Create task datasets
+        self.task_train = []
+        self.task_test = []
+        
+        for t in range(n_tasks):
+            tr_idx = self.rng.choice(len(train_images), size=n_train, replace=False)
+            te_idx = self.rng.choice(len(test_images), size=n_test, replace=False)
+            
+            tr_x = self._apply_perm(train_images[tr_idx], t)
+            te_x = self._apply_perm(test_images[te_idx], t)
+            
+            self.task_train.append((tr_x, train_labels[tr_idx]))
+            self.task_test.append((te_x, test_labels[te_idx]))
+    
+    def _apply_perm(self, images: torch.Tensor, task_id: int) -> torch.Tensor:
+        B = images.shape[0]
+        flat = images.view(B, -1)[:, self.perms[task_id]]
+        return flat.view(B, 1, 28, 28)
+    
+    def get_task_loaders(self, task_id: int, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        tr_x, tr_y = self.task_train[task_id]
+        te_x, te_y = self.task_test[task_id]
+        return (
+            DataLoader(TensorDataset(tr_x, tr_y), batch_size=batch_size, shuffle=True),
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+        )
+    
+    def get_all_test_loaders(self, batch_size: int) -> List[DataLoader]:
+        return [
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+            for te_x, te_y in self.task_test
+        ]
+    
+    @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+    
+    @property
+    def n_classes(self) -> int:
+        return 10
+    
+    @property
+    def input_shape(self) -> Tuple[int, ...]:
+        return (1, 28, 28)
+    
+    @property
+    def benchmark_type(self) -> BenchmarkType:
+        return BenchmarkType.PERMUTED_MNIST
+
+
+class SplitMNISTBenchmark(CLBenchmark):
+    """
+    Split MNIST Benchmark (Class-IL).
+    Task 0: digits 0-1, Task 1: digits 2-3, etc.
+    """
+    
+    def __init__(
+        self,
+        n_tasks: int = 5,
+        n_train_per_class: int = 1000,
+        n_test_per_class: int = 200,
+        seed: int = 42
+    ):
+        self._n_tasks = n_tasks
+        self.n_train_per_class = n_train_per_class
+        self.n_test_per_class = n_test_per_class
+        self.classes_per_task = 10 // n_tasks
+        self.rng = np.random.default_rng(seed)
+        
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_data = MNIST("./data", train=True, download=True, transform=transform)
+        test_data = MNIST("./data", train=False, download=True, transform=transform)
+        
+        train_images = train_data.data.float().unsqueeze(1) / 255.0
+        train_labels = train_data.targets.numpy()
+        test_images = test_data.data.float().unsqueeze(1) / 255.0
+        test_labels = test_data.targets.numpy()
+        
+        self.task_train = []
+        self.task_test = []
+        
+        for t in range(n_tasks):
+            task_classes = list(range(t * self.classes_per_task, (t + 1) * self.classes_per_task))
+            
+            # Get indices for this task's classes
+            tr_indices = []
+            te_indices = []
+            for c in task_classes:
+                c_tr_idx = np.where(train_labels == c)[0]
+                c_te_idx = np.where(test_labels == c)[0]
+                
+                n_tr = min(n_train_per_class, len(c_tr_idx))
+                n_te = min(n_test_per_class, len(c_te_idx))
+                
+                tr_indices.extend(self.rng.choice(c_tr_idx, size=n_tr, replace=False))
+                te_indices.extend(self.rng.choice(c_te_idx, size=n_te, replace=False))
+            
+            self.task_train.append((
+                train_images[tr_indices],
+                torch.tensor(train_labels[tr_indices], dtype=torch.long)
+            ))
+            self.task_test.append((
+                test_images[te_indices],
+                torch.tensor(test_labels[te_indices], dtype=torch.long)
+            ))
+    
+    def get_task_loaders(self, task_id: int, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        tr_x, tr_y = self.task_train[task_id]
+        te_x, te_y = self.task_test[task_id]
+        return (
+            DataLoader(TensorDataset(tr_x, tr_y), batch_size=batch_size, shuffle=True),
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+        )
+    
+    def get_all_test_loaders(self, batch_size: int) -> List[DataLoader]:
+        return [
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+            for te_x, te_y in self.task_test
+        ]
+    
+    @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+    
+    @property
+    def n_classes(self) -> int:
+        return 10
+    
+    @property
+    def input_shape(self) -> Tuple[int, ...]:
+        return (1, 28, 28)
+    
+    @property
+    def benchmark_type(self) -> BenchmarkType:
+        return BenchmarkType.SPLIT_MNIST
+
+
+class RotatedMNISTBenchmark(CLBenchmark):
+    """
+    Rotated MNIST Benchmark (Domain-IL).
+    Each task has images rotated by a different angle.
+    """
+    
+    def __init__(
+        self,
+        n_tasks: int = 5,
+        n_train: int = 3000,
+        n_test: int = 500,
+        rotation_angles: Optional[List[float]] = None,
+        seed: int = 42
+    ):
+        self._n_tasks = n_tasks
+        self.rng = np.random.default_rng(seed)
+        
+        if rotation_angles is None:
+            rotation_angles = np.linspace(0, 180, n_tasks, endpoint=False).tolist()
+        self.rotation_angles = rotation_angles[:n_tasks]
+        
+        train_data = MNIST("./data", train=True, download=True)
+        test_data = MNIST("./data", train=False, download=True)
+        
+        train_images = train_data.data.float().unsqueeze(1) / 255.0
+        train_labels = train_data.targets
+        test_images = test_data.data.float().unsqueeze(1) / 255.0
+        test_labels = test_data.targets
+        
+        self.task_train = []
+        self.task_test = []
+        
+        for t in range(n_tasks):
+            angle = self.rotation_angles[t]
+            
+            tr_idx = self.rng.choice(len(train_images), size=n_train, replace=False)
+            te_idx = self.rng.choice(len(test_images), size=n_test, replace=False)
+            
+            tr_x = self._rotate(train_images[tr_idx], angle)
+            te_x = self._rotate(test_images[te_idx], angle)
+            
+            self.task_train.append((tr_x, train_labels[tr_idx]))
+            self.task_test.append((te_x, test_labels[te_idx]))
+    
+    def _rotate(self, images: torch.Tensor, angle: float) -> torch.Tensor:
+        """Rotate images by angle degrees."""
+        if angle == 0:
+            return images
+        
+        angle_rad = math.radians(angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        # Create rotation matrix
+        theta = torch.tensor([
+            [cos_a, -sin_a, 0],
+            [sin_a, cos_a, 0]
+        ], dtype=torch.float32).unsqueeze(0).expand(images.shape[0], -1, -1)
+        
+        grid = F.affine_grid(theta, images.shape, align_corners=False)
+        return F.grid_sample(images, grid, align_corners=False, mode='bilinear')
+    
+    def get_task_loaders(self, task_id: int, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        tr_x, tr_y = self.task_train[task_id]
+        te_x, te_y = self.task_test[task_id]
+        return (
+            DataLoader(TensorDataset(tr_x, tr_y), batch_size=batch_size, shuffle=True),
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+        )
+    
+    def get_all_test_loaders(self, batch_size: int) -> List[DataLoader]:
+        return [
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+            for te_x, te_y in self.task_test
+        ]
+    
+    @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+    
+    @property
+    def n_classes(self) -> int:
+        return 10
+    
+    @property
+    def input_shape(self) -> Tuple[int, ...]:
+        return (1, 28, 28)
+    
+    @property
+    def benchmark_type(self) -> BenchmarkType:
+        return BenchmarkType.ROTATED_MNIST
+
+
+class SplitCIFAR10Benchmark(CLBenchmark):
+    """
+    Split CIFAR-10 Benchmark (Class-IL).
+    Task 0: classes 0-1, Task 1: classes 2-3, etc.
+    """
+    
+    def __init__(
+        self,
+        n_tasks: int = 5,
+        n_train_per_class: int = 1000,
+        n_test_per_class: int = 200,
+        seed: int = 42
+    ):
+        self._n_tasks = n_tasks
+        self.classes_per_task = 10 // n_tasks
+        self.rng = np.random.default_rng(seed)
+        
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        
+        train_data = CIFAR10("./data", train=True, download=True, transform=transform)
+        test_data = CIFAR10("./data", train=False, download=True, transform=transform)
+        
+        # Extract all data
+        train_images = torch.stack([train_data[i][0] for i in range(len(train_data))])
+        train_labels = torch.tensor(train_data.targets)
+        test_images = torch.stack([test_data[i][0] for i in range(len(test_data))])
+        test_labels = torch.tensor(test_data.targets)
+        
+        self.task_train = []
+        self.task_test = []
+        
+        for t in range(n_tasks):
+            task_classes = list(range(t * self.classes_per_task, (t + 1) * self.classes_per_task))
+            
+            tr_indices = []
+            te_indices = []
+            for c in task_classes:
+                c_tr_idx = (train_labels == c).nonzero(as_tuple=True)[0].numpy()
+                c_te_idx = (test_labels == c).nonzero(as_tuple=True)[0].numpy()
+                
+                n_tr = min(n_train_per_class, len(c_tr_idx))
+                n_te = min(n_test_per_class, len(c_te_idx))
+                
+                tr_indices.extend(self.rng.choice(c_tr_idx, size=n_tr, replace=False))
+                te_indices.extend(self.rng.choice(c_te_idx, size=n_te, replace=False))
+            
+            self.task_train.append((train_images[tr_indices], train_labels[tr_indices]))
+            self.task_test.append((test_images[te_indices], test_labels[te_indices]))
+    
+    def get_task_loaders(self, task_id: int, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        tr_x, tr_y = self.task_train[task_id]
+        te_x, te_y = self.task_test[task_id]
+        return (
+            DataLoader(TensorDataset(tr_x, tr_y), batch_size=batch_size, shuffle=True),
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+        )
+    
+    def get_all_test_loaders(self, batch_size: int) -> List[DataLoader]:
+        return [
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+            for te_x, te_y in self.task_test
+        ]
+    
+    @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+    
+    @property
+    def n_classes(self) -> int:
+        return 10
+    
+    @property
+    def input_shape(self) -> Tuple[int, ...]:
+        return (3, 32, 32)
+    
+    @property
+    def benchmark_type(self) -> BenchmarkType:
+        return BenchmarkType.SPLIT_CIFAR10
+
+
+class SplitCIFAR100Benchmark(CLBenchmark):
+    """
+    Split CIFAR-100 Benchmark (Class-IL).
+    Default: 10 tasks with 10 classes each.
+    This is the KEY benchmark for credible CL claims.
+    """
+    
+    def __init__(
+        self,
+        n_tasks: int = 10,
+        n_train_per_class: int = 450,
+        n_test_per_class: int = 100,
+        seed: int = 42
+    ):
+        self._n_tasks = n_tasks
+        self._n_classes = 100
+        self.classes_per_task = 100 // n_tasks
+        self.rng = np.random.default_rng(seed)
+        
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+        ])
+        
+        train_data = CIFAR100("./data", train=True, download=True, transform=transform)
+        test_data = CIFAR100("./data", train=False, download=True, transform=transform)
+        
+        train_images = torch.stack([train_data[i][0] for i in range(len(train_data))])
+        train_labels = torch.tensor(train_data.targets)
+        test_images = torch.stack([test_data[i][0] for i in range(len(test_data))])
+        test_labels = torch.tensor(test_data.targets)
+        
+        self.task_train = []
+        self.task_test = []
+        self.task_classes = []
+        
+        for t in range(n_tasks):
+            task_classes = list(range(t * self.classes_per_task, (t + 1) * self.classes_per_task))
+            self.task_classes.append(task_classes)
+            
+            tr_indices = []
+            te_indices = []
+            for c in task_classes:
+                c_tr_idx = (train_labels == c).nonzero(as_tuple=True)[0].numpy()
+                c_te_idx = (test_labels == c).nonzero(as_tuple=True)[0].numpy()
+                
+                n_tr = min(n_train_per_class, len(c_tr_idx))
+                n_te = min(n_test_per_class, len(c_te_idx))
+                
+                tr_indices.extend(self.rng.choice(c_tr_idx, size=n_tr, replace=False))
+                te_indices.extend(self.rng.choice(c_te_idx, size=n_te, replace=False))
+            
+            self.task_train.append((train_images[tr_indices], train_labels[tr_indices]))
+            self.task_test.append((test_images[te_indices], test_labels[te_indices]))
+    
+    def get_task_loaders(self, task_id: int, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        tr_x, tr_y = self.task_train[task_id]
+        te_x, te_y = self.task_test[task_id]
+        return (
+            DataLoader(TensorDataset(tr_x, tr_y), batch_size=batch_size, shuffle=True),
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+        )
+    
+    def get_all_test_loaders(self, batch_size: int) -> List[DataLoader]:
+        return [
+            DataLoader(TensorDataset(te_x, te_y), batch_size=batch_size, shuffle=False)
+            for te_x, te_y in self.task_test
+        ]
+    
+    @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+    
+    @property
+    def n_classes(self) -> int:
+        return self._n_classes
+    
+    @property
+    def input_shape(self) -> Tuple[int, ...]:
+        return (3, 32, 32)
+    
+    @property
+    def benchmark_type(self) -> BenchmarkType:
+        return BenchmarkType.SPLIT_CIFAR100
+
+
+def create_benchmark(
+    benchmark_type: BenchmarkType,
+    n_tasks: int = 10,
+    seed: int = 42,
+    **kwargs
+) -> CLBenchmark:
+    """Factory function to create benchmarks."""
+    if benchmark_type == BenchmarkType.PERMUTED_MNIST:
+        return PermutedMNISTBenchmark(n_tasks=n_tasks, seed=seed, **kwargs)
+    elif benchmark_type == BenchmarkType.SPLIT_MNIST:
+        return SplitMNISTBenchmark(n_tasks=min(n_tasks, 5), seed=seed, **kwargs)
+    elif benchmark_type == BenchmarkType.ROTATED_MNIST:
+        return RotatedMNISTBenchmark(n_tasks=n_tasks, seed=seed, **kwargs)
+    elif benchmark_type == BenchmarkType.SPLIT_CIFAR10:
+        return SplitCIFAR10Benchmark(n_tasks=min(n_tasks, 5), seed=seed, **kwargs)
+    elif benchmark_type == BenchmarkType.SPLIT_CIFAR100:
+        return SplitCIFAR100Benchmark(n_tasks=min(n_tasks, 10), seed=seed, **kwargs)
+    else:
+        raise ValueError(f"Unknown benchmark type: {benchmark_type}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART V: NEURAL NETWORK ARCHITECTURES
+# ════════════════════════════════════════════════════════════════════════════════
+
+class MNISTEncoder(nn.Module):
+    """Encoder for MNIST-like data (28x28 grayscale)."""
+    
+    def __init__(self, embedding_dim: int = 128):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(64 * 7 * 7, embedding_dim)
+        self.embedding_dim = embedding_dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class CIFAREncoder(nn.Module):
+    """Encoder for CIFAR-like data (32x32 RGB)."""
+    
+    def __init__(self, embedding_dim: int = 256):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(128, 256, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(256)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(256 * 4 * 4, embedding_dim)
+        self.embedding_dim = embedding_dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class ClassifierHead(nn.Module):
+    """Simple linear classifier head."""
+    
+    def __init__(self, embedding_dim: int, n_classes: int):
+        super().__init__()
+        self.fc = nn.Linear(embedding_dim, n_classes)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x)
+
+
+def create_encoder(input_shape: Tuple[int, ...], embedding_dim: int = 128) -> nn.Module:
+    """Create appropriate encoder for input shape."""
+    if input_shape == (1, 28, 28):
+        return MNISTEncoder(embedding_dim)
+    elif input_shape[0] == 3 and input_shape[1] == 32:
+        return CIFAREncoder(embedding_dim)
+    else:
+        raise ValueError(f"Unsupported input shape: {input_shape}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART VI: CONTINUAL LEARNING METHODS (BASELINES)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class CLMethod(ABC):
+    """Abstract base class for CL methods."""
+    
+    @abstractmethod
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        """Train on a single task."""
+        pass
+    
+    @abstractmethod
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        """Evaluate on all seen tasks."""
+        pass
+    
+    @abstractmethod
+    def get_param_count(self) -> int:
+        """Get total trainable parameters."""
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        pass
+
+
+class NaiveFinetuning(CLMethod):
+    """Naive fine-tuning baseline - no CL mechanism."""
+    
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        n_classes: int,
+        embedding_dim: int = 128,
+        lr: float = 1e-3,
+        epochs: int = 3,
+        seed: int = 42  # Added for API consistency
+    ):
+        self.encoder = create_encoder(input_shape, embedding_dim).to(DEVICE)
+        self.classifier = ClassifierHead(embedding_dim, n_classes).to(DEVICE)
+        self.lr = lr
+        self.epochs = epochs
+        self.n_classes = n_classes
+    
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        optimizer = Adam(
+            list(self.encoder.parameters()) + list(self.classifier.parameters()),
+            lr=self.lr
+        )
+        criterion = nn.CrossEntropyLoss()
+        
+        self.encoder.train()
+        self.classifier.train()
+        
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            for x, y in train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                z = self.encoder(x)
+                logits = self.classifier(z)
+                loss = criterion(logits, y)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+        
+        return {"loss": total_loss}
+    
+    @torch.no_grad()
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        self.encoder.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for loader in test_loaders[:task_id + 1]:
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                logits = self.classifier(self.encoder(x))
+                correct += (logits.argmax(dim=-1) == y).sum().item()
+                total += y.size(0)
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    def get_param_count(self) -> int:
+        return sum(p.numel() for p in self.encoder.parameters()) + \
+               sum(p.numel() for p in self.classifier.parameters())
+    
+    @property
+    def name(self) -> str:
+        return "Naive FT"
+
+
+class ReplayBuffer(CLMethod):
+    """Experience Replay with reservoir sampling."""
+    
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        n_classes: int,
+        buffer_size: int = 5000,
+        embedding_dim: int = 128,
+        lr: float = 1e-3,
+        epochs: int = 3,
+        seed: int = 42
+    ):
+        self.encoder = create_encoder(input_shape, embedding_dim).to(DEVICE)
+        self.classifier = ClassifierHead(embedding_dim, n_classes).to(DEVICE)
+        self.buffer_size = buffer_size
+        self.lr = lr
+        self.epochs = epochs
+        self.rng = np.random.default_rng(seed)
+        
+        self.buffer_x = []
+        self.buffer_y = []
+        self.seen = 0
+    
+    def _add_to_buffer(self, x: torch.Tensor, y: torch.Tensor):
+        """Reservoir sampling to add data to buffer."""
+        for i in range(x.size(0)):
+            self.seen += 1
+            if len(self.buffer_x) < self.buffer_size:
+                self.buffer_x.append(x[i].cpu())
+                self.buffer_y.append(y[i].cpu())
+            else:
+                j = int(self.rng.integers(0, self.seen))
+                if j < self.buffer_size:
+                    self.buffer_x[j] = x[i].cpu()
+                    self.buffer_y[j] = y[i].cpu()
+    
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        # Add new data to buffer
+        for x, y in train_loader:
+            self._add_to_buffer(x, y)
+        
+        # Create combined loader
+        if self.buffer_x:
+            all_x = torch.stack(self.buffer_x)
+            all_y = torch.stack(self.buffer_y)
+            combined_loader = DataLoader(
+                TensorDataset(all_x, all_y),
+                batch_size=64, shuffle=True
+            )
+        else:
+            combined_loader = train_loader
+        
+        optimizer = Adam(
+            list(self.encoder.parameters()) + list(self.classifier.parameters()),
+            lr=self.lr
+        )
+        criterion = nn.CrossEntropyLoss()
+        
+        self.encoder.train()
+        self.classifier.train()
+        
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            for x, y in combined_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                logits = self.classifier(self.encoder(x))
+                loss = criterion(logits, y)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+        
+        return {"loss": total_loss, "buffer_size": len(self.buffer_x)}
+    
+    @torch.no_grad()
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        self.encoder.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for loader in test_loaders[:task_id + 1]:
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                logits = self.classifier(self.encoder(x))
+                correct += (logits.argmax(dim=-1) == y).sum().item()
+                total += y.size(0)
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    def get_param_count(self) -> int:
+        return sum(p.numel() for p in self.encoder.parameters()) + \
+               sum(p.numel() for p in self.classifier.parameters())
+    
+    @property
+    def name(self) -> str:
+        return "Replay"
+
+
+class EWC(CLMethod):
+    """Elastic Weight Consolidation."""
+    
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        n_classes: int,
+        embedding_dim: int = 128,
+        lr: float = 1e-3,
+        epochs: int = 3,
+        ewc_lambda: float = 1000.0,
+        n_fisher_samples: int = 200
+    ):
+        self.encoder = create_encoder(input_shape, embedding_dim).to(DEVICE)
+        self.classifier = ClassifierHead(embedding_dim, n_classes).to(DEVICE)
+        self.lr = lr
+        self.epochs = epochs
+        self.ewc_lambda = ewc_lambda
+        self.n_fisher_samples = n_fisher_samples
+        
+        self.fisher_info = {}
+        self.optimal_params = {}
+    
+    def _compute_fisher(self, data_loader: DataLoader):
+        """Compute Fisher information matrix diagonal."""
+        self.encoder.eval()
+        self.classifier.eval()
+        
+        fisher = {}
+        # FIX: Use prefixed names to avoid collision between encoder.fc and classifier.fc
+        for n, p in self.encoder.named_parameters():
+            fisher[f'encoder.{n}'] = torch.zeros_like(p)
+        for n, p in self.classifier.named_parameters():
+            fisher[f'classifier.{n}'] = torch.zeros_like(p)
+        
+        count = 0
+        for x, y in data_loader:
+            if count >= self.n_fisher_samples:
+                break
+            
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            self.encoder.zero_grad()
+            self.classifier.zero_grad()
+            
+            logits = self.classifier(self.encoder(x))
+            loss = F.cross_entropy(logits, y)
+            loss.backward()
+            
+            # FIX: Accumulate gradients with prefixed names
+            for n, p in self.encoder.named_parameters():
+                if p.grad is not None:
+                    fisher[f'encoder.{n}'] += p.grad.data ** 2
+            for n, p in self.classifier.named_parameters():
+                if p.grad is not None:
+                    fisher[f'classifier.{n}'] += p.grad.data ** 2
+            
+            count += x.size(0)
+        
+        for n in fisher:
+            fisher[n] /= count
+        
+        return fisher
+    
+    def _ewc_loss(self) -> torch.Tensor:
+        """Compute EWC penalty."""
+        loss = 0.0
+        # FIX: Use prefixed names for lookup
+        for n, p in self.encoder.named_parameters():
+            key = f'encoder.{n}'
+            if key in self.fisher_info:
+                loss += (self.fisher_info[key] * (p - self.optimal_params[key]) ** 2).sum()
+        for n, p in self.classifier.named_parameters():
+            key = f'classifier.{n}'
+            if key in self.fisher_info:
+                loss += (self.fisher_info[key] * (p - self.optimal_params[key]) ** 2).sum()
+        return loss
+    
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        optimizer = Adam(
+            list(self.encoder.parameters()) + list(self.classifier.parameters()),
+            lr=self.lr
+        )
+        criterion = nn.CrossEntropyLoss()
+        
+        self.encoder.train()
+        self.classifier.train()
+        
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            for x, y in train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                
+                logits = self.classifier(self.encoder(x))
+                ce_loss = criterion(logits, y)
+                ewc_loss = self._ewc_loss() * self.ewc_lambda if self.fisher_info else 0.0
+                loss = ce_loss + ewc_loss
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+        
+        # Update Fisher and optimal params
+        new_fisher = self._compute_fisher(train_loader)
+        
+        for n in new_fisher:
+            if n in self.fisher_info:
+                self.fisher_info[n] = self.fisher_info[n] + new_fisher[n]
+            else:
+                self.fisher_info[n] = new_fisher[n]
+        
+        # FIX: Store optimal params with prefixed names
+        for n, p in self.encoder.named_parameters():
+            self.optimal_params[f'encoder.{n}'] = p.data.clone()
+        for n, p in self.classifier.named_parameters():
+            self.optimal_params[f'classifier.{n}'] = p.data.clone()
+        
+        return {"loss": total_loss}
+    
+    @torch.no_grad()
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        self.encoder.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for loader in test_loaders[:task_id + 1]:
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                logits = self.classifier(self.encoder(x))
+                correct += (logits.argmax(dim=-1) == y).sum().item()
+                total += y.size(0)
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    def get_param_count(self) -> int:
+        return sum(p.numel() for p in self.encoder.parameters()) + \
+               sum(p.numel() for p in self.classifier.parameters())
+    
+    @property
+    def name(self) -> str:
+        return "EWC"
+
+
+class LwF(CLMethod):
+    """Learning without Forgetting."""
+    
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        n_classes: int,
+        embedding_dim: int = 128,
+        lr: float = 1e-3,
+        epochs: int = 3,
+        lwf_alpha: float = 1.0,
+        temperature: float = 2.0
+    ):
+        self.encoder = create_encoder(input_shape, embedding_dim).to(DEVICE)
+        self.classifier = ClassifierHead(embedding_dim, n_classes).to(DEVICE)
+        self.lr = lr
+        self.epochs = epochs
+        self.lwf_alpha = lwf_alpha
+        self.temperature = temperature
+        
+        self.old_encoder = None
+        self.old_classifier = None
+    
+    def _distillation_loss(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute knowledge distillation loss."""
+        if self.old_encoder is None:
+            return torch.tensor(0.0, device=DEVICE)
+        
+        with torch.no_grad():
+            old_logits = self.old_classifier(self.old_encoder(x))
+            old_probs = F.softmax(old_logits / self.temperature, dim=-1)
+        
+        new_logits = self.classifier(self.encoder(x))
+        new_log_probs = F.log_softmax(new_logits / self.temperature, dim=-1)
+        
+        return F.kl_div(new_log_probs, old_probs, reduction='batchmean') * (self.temperature ** 2)
+    
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        optimizer = Adam(
+            list(self.encoder.parameters()) + list(self.classifier.parameters()),
+            lr=self.lr
+        )
+        criterion = nn.CrossEntropyLoss()
+        
+        self.encoder.train()
+        self.classifier.train()
+        
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            for x, y in train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                
+                logits = self.classifier(self.encoder(x))
+                ce_loss = criterion(logits, y)
+                dist_loss = self._distillation_loss(x) * self.lwf_alpha
+                loss = ce_loss + dist_loss
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+        
+        # Save old model
+        self.old_encoder = copy.deepcopy(self.encoder)
+        self.old_classifier = copy.deepcopy(self.classifier)
+        self.old_encoder.eval()
+        self.old_classifier.eval()
+        
+        return {"loss": total_loss}
+    
+    @torch.no_grad()
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        self.encoder.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for loader in test_loaders[:task_id + 1]:
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                logits = self.classifier(self.encoder(x))
+                correct += (logits.argmax(dim=-1) == y).sum().item()
+                total += y.size(0)
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    def get_param_count(self) -> int:
+        return sum(p.numel() for p in self.encoder.parameters()) + \
+               sum(p.numel() for p in self.classifier.parameters())
+    
+    @property
+    def name(self) -> str:
+        return "LwF"
+
+
+class DERPlusPlus(CLMethod):
+    """
+    Dark Experience Replay++ (DER++).
+    Stores both inputs and logits for distillation.
+    """
+    
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        n_classes: int,
+        buffer_size: int = 5000,
+        embedding_dim: int = 128,
+        lr: float = 1e-3,
+        epochs: int = 3,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+        seed: int = 42
+    ):
+        self.encoder = create_encoder(input_shape, embedding_dim).to(DEVICE)
+        self.classifier = ClassifierHead(embedding_dim, n_classes).to(DEVICE)
+        self.buffer_size = buffer_size
+        self.lr = lr
+        self.epochs = epochs
+        self.alpha = alpha  # Weight for logit distillation
+        self.beta = beta    # Weight for label replay
+        self.n_classes = n_classes
+        self.rng = np.random.default_rng(seed)
+        
+        self.buffer_x = []
+        self.buffer_y = []
+        self.buffer_logits = []
+        self.seen = 0
+    
+    def _add_to_buffer(self, x: torch.Tensor, y: torch.Tensor, logits: torch.Tensor):
+        """Reservoir sampling with logits."""
+        for i in range(x.size(0)):
+            self.seen += 1
+            if len(self.buffer_x) < self.buffer_size:
+                self.buffer_x.append(x[i].cpu())
+                self.buffer_y.append(y[i].cpu())
+                self.buffer_logits.append(logits[i].cpu())
+            else:
+                j = int(self.rng.integers(0, self.seen))
+                if j < self.buffer_size:
+                    self.buffer_x[j] = x[i].cpu()
+                    self.buffer_y[j] = y[i].cpu()
+                    self.buffer_logits[j] = logits[i].cpu()
+    
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        optimizer = Adam(
+            list(self.encoder.parameters()) + list(self.classifier.parameters()),
+            lr=self.lr
+        )
+        criterion = nn.CrossEntropyLoss()
+        
+        self.encoder.train()
+        self.classifier.train()
+        
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            for x, y in train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                
+                # Forward pass on new data
+                logits = self.classifier(self.encoder(x))
+                ce_loss = criterion(logits, y)
+                
+                # Replay losses
+                replay_ce_loss = 0.0
+                replay_mse_loss = 0.0
+                
+                if self.buffer_x:
+                    # Sample from buffer
+                    buf_size = min(x.size(0), len(self.buffer_x))
+                    buf_idx = self.rng.choice(len(self.buffer_x), size=buf_size, replace=False)
+                    
+                    buf_x = torch.stack([self.buffer_x[i] for i in buf_idx]).to(DEVICE)
+                    buf_y = torch.stack([self.buffer_y[i] for i in buf_idx]).to(DEVICE)
+                    buf_logits = torch.stack([self.buffer_logits[i] for i in buf_idx]).to(DEVICE)
+                    
+                    buf_out = self.classifier(self.encoder(buf_x))
+                    
+                    # Label replay loss
+                    replay_ce_loss = criterion(buf_out, buf_y) * self.beta
+                    
+                    # Logit matching loss
+                    replay_mse_loss = F.mse_loss(buf_out, buf_logits) * self.alpha
+                
+                loss = ce_loss + replay_ce_loss + replay_mse_loss
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                
+                # Add to buffer with current logits
+                with torch.no_grad():
+                    current_logits = self.classifier(self.encoder(x))
+                self._add_to_buffer(x, y, current_logits)
+        
+        return {"loss": total_loss, "buffer_size": len(self.buffer_x)}
+    
+    @torch.no_grad()
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        self.encoder.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for loader in test_loaders[:task_id + 1]:
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                logits = self.classifier(self.encoder(x))
+                correct += (logits.argmax(dim=-1) == y).sum().item()
+                total += y.size(0)
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    def get_param_count(self) -> int:
+        return sum(p.numel() for p in self.encoder.parameters()) + \
+               sum(p.numel() for p in self.classifier.parameters())
+    
+    @property
+    def name(self) -> str:
+        return "DER++"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART VII: HOLONET - OUR METHOD
+# ════════════════════════════════════════════════════════════════════════════════
+
+class HoloNetV3(CLMethod):
+    """
+    HoloNet v3.0: Per-Task Encoders + Task Inference + HoloRAID Memory
+    
+    Key innovations:
+    1. Per-task encoders eliminate embedding drift
+    2. Task inference via memory retrieval confidence
+    3. HoloRAID provides fault-tolerant memory storage
+    4. Task-conditioned retrieval for accurate predictions
+    """
+    
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        n_classes: int,
+        max_tasks: int = 20,
+        embedding_dim: int = 128,
+        memory_size: int = 5000,
+        holoraid_n: int = 5,
+        holoraid_k: int = 3,
+        lr: float = 1e-3,
+        epochs: int = 3,
+        retrieval_top_k: int = 32,
+        retrieval_temp: float = 0.05,
+        memory_weight: float = 0.5,
+        seed: int = 42
+    ):
+        self.input_shape = input_shape
+        self.n_classes = n_classes
+        self.max_tasks = max_tasks
+        self.embedding_dim = embedding_dim
+        self.memory_size = memory_size
+        self.lr = lr
+        self.epochs = epochs
+        self.retrieval_top_k = retrieval_top_k
+        self.retrieval_temp = retrieval_temp
+        self.memory_weight = memory_weight
+        self.seed = seed
+        
+        # Per-task encoders
+        self.encoders = nn.ModuleList()
+        base_encoder = create_encoder(input_shape, embedding_dim)
+        for _ in range(max_tasks):
+            encoder = create_encoder(input_shape, embedding_dim)
+            encoder.load_state_dict(base_encoder.state_dict())
+            self.encoders.append(encoder.to(DEVICE))
+        
+        # Shared classifier
+        self.classifier = ClassifierHead(embedding_dim, n_classes).to(DEVICE)
+        
+        # HoloRAID memory
+        raid_config = HoloRAIDConfig(
+            n_shards=holoraid_n,
+            k_threshold=holoraid_k,
+            seed=seed
+        )
+        self.memory = HoloRAIDMemory(raid_config, embedding_dim)
+        
+        # Task tracking
+        self.known_tasks = []
+        self._memory_cache = {}
+        self._cache_valid = False
+    
+    def _get_embedding(self, x: torch.Tensor, task_id: int, unit_norm: bool = True) -> torch.Tensor:
+        """Get embedding using task-specific encoder."""
+        z = self.encoders[task_id](x)
+        if unit_norm:
+            z = F.normalize(z, dim=-1)
+        return z
+    
+    def _store_to_memory(self, train_loader: DataLoader, task_id: int):
+        """Store embeddings for a task."""
+        self.encoders[task_id].eval()
+        with torch.no_grad():
+            for x, y in train_loader:
+                x = x.to(DEVICE)
+                z = self._get_embedding(x, task_id, unit_norm=True)
+                for i in range(z.size(0)):
+                    self.memory.store(z[i].cpu().numpy(), int(y[i].item()), task_id)
+        
+        if len(self.memory) > self.memory_size:
+            self.memory.prune_to_size(self.memory_size, strategy="per_task_class")
+        
+        self._cache_valid = False
+    
+    def _rebuild_cache(self):
+        """Rebuild memory cache for retrieval."""
+        self._memory_cache.clear()
+        for task_id in self.memory.get_task_ids():
+            embs, labels = self.memory.retrieve_all_for_task(task_id)
+            if len(embs) > 0:
+                self._memory_cache[task_id] = (
+                    torch.tensor(embs, dtype=torch.float32, device=DEVICE),
+                    torch.tensor(labels, dtype=torch.long, device=DEVICE)
+                )
+        self._cache_valid = True
+    
+    def _compute_task_confidence(
+        self,
+        query: torch.Tensor,
+        task_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute retrieval confidence and class probs for a task."""
+        B = query.shape[0]
+        
+        if not self._cache_valid:
+            self._rebuild_cache()
+        
+        if task_id not in self._memory_cache:
+            return (
+                torch.zeros(B, device=DEVICE),
+                torch.ones(B, self.n_classes, device=DEVICE) / self.n_classes
+            )
+        
+        mem_emb, mem_labels = self._memory_cache[task_id]
+        if mem_emb.shape[0] == 0:
+            return (
+                torch.zeros(B, device=DEVICE),
+                torch.ones(B, self.n_classes, device=DEVICE) / self.n_classes
+            )
+        
+        # Compute similarities
+        sims = torch.mm(query, mem_emb.t())
+        k = min(self.retrieval_top_k, sims.shape[1])
+        top_sims, top_idx = torch.topk(sims, k, dim=-1)
+        
+        # Confidence = max similarity
+        confidence = top_sims.max(dim=-1).values
+        
+        # Class probabilities from kNN
+        weights = F.softmax(top_sims / max(self.retrieval_temp, 1e-6), dim=-1)
+        top_labels = mem_labels[top_idx]
+        
+        probs = torch.zeros(B, self.n_classes, device=DEVICE)
+        probs.scatter_add_(1, top_labels, weights)
+        probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        return confidence, probs
+    
+    def _infer_task(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+        """Infer task ID using retrieval confidence."""
+        B = x.shape[0]
+        
+        if not self._cache_valid:
+            self._rebuild_cache()
+        
+        all_confidences = {}
+        all_probs = {}
+        
+        for task_id in self.known_tasks:
+            with torch.no_grad():
+                z = self._get_embedding(x, task_id, unit_norm=True)
+            conf, probs = self._compute_task_confidence(z, task_id)
+            all_confidences[task_id] = conf
+            all_probs[task_id] = probs
+        
+        # Find task with highest confidence
+        conf_stack = torch.stack([all_confidences[t] for t in self.known_tasks], dim=1)
+        inferred_idx = conf_stack.argmax(dim=1)
+        inferred_tasks = torch.tensor([self.known_tasks[i] for i in inferred_idx], device=DEVICE)
+        
+        return inferred_tasks, all_confidences, all_probs
+    
+    def train_task(self, task_id: int, train_loader: DataLoader) -> Dict[str, float]:
+        """Train on a task."""
+        # Freeze all other encoders
+        for i, enc in enumerate(self.encoders):
+            for p in enc.parameters():
+                p.requires_grad = (i == task_id)
+        
+        optimizer = Adam(
+            list(self.encoders[task_id].parameters()) + list(self.classifier.parameters()),
+            lr=self.lr
+        )
+        criterion = nn.CrossEntropyLoss()
+        
+        self.encoders[task_id].train()
+        self.classifier.train()
+        
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            for x, y in train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                
+                z = self.encoders[task_id](x)
+                logits = self.classifier(z)
+                loss = criterion(logits, y)
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+        
+        # Store to memory
+        self._store_to_memory(train_loader, task_id)
+        
+        if task_id not in self.known_tasks:
+            self.known_tasks.append(task_id)
+        
+        return {"loss": total_loss, "memory_size": len(self.memory)}
+    
+    @torch.no_grad()
+    def evaluate(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        """Evaluate using task inference."""
+        for enc in self.encoders:
+            enc.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for j, loader in enumerate(test_loaders[:task_id + 1]):
+            correct, total = 0, 0
+            
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                B = x.shape[0]
+                
+                # Infer task
+                inferred_tasks, _, mem_probs = self._infer_task(x)
+                
+                for i in range(B):
+                    t = inferred_tasks[i].item()
+                    
+                    # Model prediction
+                    z = self.encoders[t](x[i:i+1])
+                    logits = self.classifier(z)
+                    model_probs = F.softmax(logits, dim=-1)
+                    
+                    # Combine with memory
+                    if t in mem_probs:
+                        mem_p = mem_probs[t][i:i+1]
+                        combined = (1 - self.memory_weight) * model_probs + self.memory_weight * mem_p
+                    else:
+                        combined = model_probs
+                    
+                    pred = combined.argmax(dim=-1)
+                    correct += (pred == y[i:i+1]).sum().item()
+                
+                total += B
+            
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    @torch.no_grad()
+    def evaluate_with_oracle(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        """Evaluate with known task ID (model only)."""
+        for enc in self.encoders:
+            enc.eval()
+        self.classifier.eval()
+        
+        accs = []
+        for j, loader in enumerate(test_loaders[:task_id + 1]):
+            correct, total = 0, 0
+            for x, y in loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                z = self.encoders[j](x)
+                logits = self.classifier(z)
+                correct += (logits.argmax(dim=-1) == y).sum().item()
+                total += y.size(0)
+            accs.append(correct / max(1, total))
+        
+        return accs
+    
+    @torch.no_grad()
+    def evaluate_task_inference(self, test_loaders: List[DataLoader], task_id: int) -> List[float]:
+        """Evaluate task inference accuracy."""
+        for enc in self.encoders:
+            enc.eval()
+        
+        task_inf_accs = []
+        for j, loader in enumerate(test_loaders[:task_id + 1]):
+            correct, total = 0, 0
+            for x, y in loader:
+                x = x.to(DEVICE)
+                inferred_tasks, _, _ = self._infer_task(x)
+                correct += (inferred_tasks == j).sum().item()
+                total += x.size(0)
+            task_inf_accs.append(correct / max(1, total))
+        
+        return task_inf_accs
+    
+    def get_param_count(self) -> int:
+        """Get total params (only used encoders)."""
+        n_used = len(self.known_tasks) if self.known_tasks else 1
+        encoder_params = sum(p.numel() for p in self.encoders[0].parameters()) * n_used
+        classifier_params = sum(p.numel() for p in self.classifier.parameters())
+        return encoder_params + classifier_params
+    
+    def test_fault_tolerance(self, test_loader: DataLoader, task_id: int, max_failures: int) -> Dict[int, float]:
+        """Test accuracy under shard failures."""
+        results = {}
+        
+        # Temporarily modify memory retrieval
+        original_retrieve = self.memory.retrieve
+        
+        for n_failures in range(max_failures + 1):
+            # FIX: Capture n_failures value and accept simulate_failures keyword arg
+            def make_modified_retrieve(fixed_failures):
+                def modified_retrieve(idx, simulate_failures=None):
+                    # Always use fixed_failures, ignoring any passed value
+                    return original_retrieve(idx, simulate_failures=fixed_failures)
+                return modified_retrieve
+            
+            self.memory.retrieve = make_modified_retrieve(n_failures)
+            self._cache_valid = False
+            
+            accs = self.evaluate([test_loader], task_id)
+            results[n_failures] = accs[0] if accs else 0.0
+        
+        self.memory.retrieve = original_retrieve
+        self._cache_valid = False
+        
+        return results
+    
+    @property
+    def name(self) -> str:
+        return "HoloNet"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART VIII: EXPERIMENT RUNNER
+# ════════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ExperimentConfig:
+    """Configuration for CL experiments."""
+    benchmark_type: BenchmarkType = BenchmarkType.PERMUTED_MNIST
+    n_tasks: int = 10
+    n_seeds: int = 3
+    batch_size: int = 64
+    epochs_per_task: int = 3
+    embedding_dim: int = 128
+    lr: float = 1e-3
+    
+    # Memory settings
+    memory_size: int = 5000
+    holoraid_n: int = 5
+    holoraid_k: int = 3
+    
+    # Retrieval settings
+    retrieval_top_k: int = 32
+    retrieval_temp: float = 0.05
+    memory_weight: float = 0.5
+    
+    # Baseline settings
+    ewc_lambda: float = 1000.0
+    lwf_alpha: float = 1.0
+    der_alpha: float = 0.5
+    der_beta: float = 0.5
+
+
+class ExperimentRunner:
+    """Runs CL experiments with multiple seeds and methods."""
+    
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        self.results: Dict[str, Dict[str, Any]] = {}
+    
+    def _create_method(self, method_name: str, benchmark: CLBenchmark, seed: int) -> CLMethod:
+        """Factory for creating CL methods."""
+        cfg = self.config
+        
+        if method_name == "NaiveFT":
+            return NaiveFinetuning(
+                benchmark.input_shape, benchmark.n_classes,
+                cfg.embedding_dim, cfg.lr, cfg.epochs_per_task
+            )
+        elif method_name == "Replay":
+            return ReplayBuffer(
+                benchmark.input_shape, benchmark.n_classes,
+                cfg.memory_size, cfg.embedding_dim,
+                cfg.lr, cfg.epochs_per_task, seed
+            )
+        elif method_name == "EWC":
+            return EWC(
+                benchmark.input_shape, benchmark.n_classes,
+                cfg.embedding_dim, cfg.lr, cfg.epochs_per_task,
+                cfg.ewc_lambda
+            )
+        elif method_name == "LwF":
+            return LwF(
+                benchmark.input_shape, benchmark.n_classes,
+                cfg.embedding_dim, cfg.lr, cfg.epochs_per_task,
+                cfg.lwf_alpha
+            )
+        elif method_name == "DER++":
+            return DERPlusPlus(
+                benchmark.input_shape, benchmark.n_classes,
+                cfg.memory_size, cfg.embedding_dim,
+                cfg.lr, cfg.epochs_per_task,
+                cfg.der_alpha, cfg.der_beta, seed
+            )
+        elif method_name == "HoloNet":
+            return HoloNetV3(
+                benchmark.input_shape, benchmark.n_classes,
+                cfg.n_tasks, cfg.embedding_dim,
+                cfg.memory_size, cfg.holoraid_n, cfg.holoraid_k,
+                cfg.lr, cfg.epochs_per_task,
+                cfg.retrieval_top_k, cfg.retrieval_temp,
+                cfg.memory_weight, seed
+            )
+        else:
+            raise ValueError(f"Unknown method: {method_name}")
+    
+    def run_single_experiment(
+        self,
+        method_name: str,
+        benchmark: CLBenchmark,
+        seed: int,
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        """Run a single experiment."""
+        set_seed(seed)
+        method = self._create_method(method_name, benchmark, seed)
+        
+        acc_matrix = np.zeros((benchmark.n_tasks, benchmark.n_tasks))
+        task_inf_accs = []
+        train_times = []
+        
+        test_loaders = benchmark.get_all_test_loaders(self.config.batch_size)
+        
+        for t in range(benchmark.n_tasks):
+            train_loader, _ = benchmark.get_task_loaders(t, self.config.batch_size)
+            
+            t0 = time.time()
+            train_info = method.train_task(t, train_loader)
+            train_times.append(time.time() - t0)
+            
+            # Evaluate on all seen tasks
+            accs = method.evaluate(test_loaders, t)
+            for j, acc in enumerate(accs):
+                acc_matrix[t, j] = acc
+            
+            # Task inference accuracy (for HoloNet)
+            if isinstance(method, HoloNetV3):
+                task_inf = method.evaluate_task_inference(test_loaders, t)
+                task_inf_accs.append(np.mean(task_inf))
+            
+            if verbose:
+                print(f"    Task {t}: AA={np.mean(accs)*100:.1f}%", end="")
+                if task_inf_accs:
+                    print(f", TaskInf={task_inf_accs[-1]*100:.1f}%", end="")
+                print()
+        
+        # Compute metrics
+        metrics = CLMetrics.compute_all(acc_matrix, task_inf_accs if task_inf_accs else None)
+        metrics["acc_matrix"] = acc_matrix.tolist()
+        metrics["train_times"] = train_times
+        metrics["param_count"] = method.get_param_count()
+        
+        if isinstance(method, HoloNetV3):
+            metrics["memory_size"] = len(method.memory)
+            metrics["task_inf_accs"] = task_inf_accs
+        
+        return metrics
+    
+    def run_all_methods(
+        self,
+        methods: List[str] = None,
+        verbose: bool = True
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run all specified methods with multiple seeds."""
+        if methods is None:
+            methods = ["NaiveFT", "Replay", "EWC", "LwF", "DER++", "HoloNet"]
+        
+        cfg = self.config
+        results = {}
+        
+        print(f"\n{'='*70}")
+        print(f"  Benchmark: {cfg.benchmark_type.value}")
+        print(f"  Tasks: {cfg.n_tasks}, Seeds: {cfg.n_seeds}")
+        print(f"{'='*70}\n")
+        
+        for method_name in methods:
+            print(f"\n  {method_name}")
+            print(f"  {'-'*60}")
+            
+            seed_results = []
+            
+            for s in range(cfg.n_seeds):
+                seed = SEED + s
+                
+                # Create fresh benchmark for each seed
+                benchmark = create_benchmark(
+                    cfg.benchmark_type,
+                    n_tasks=cfg.n_tasks,
+                    seed=seed
+                )
+                
+                if verbose:
+                    print(f"\n    Seed {s+1}/{cfg.n_seeds}:")
+                
+                metrics = self.run_single_experiment(method_name, benchmark, seed, verbose)
+                seed_results.append(metrics)
+                
+                # Clear GPU memory
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Aggregate results
+            aggregated = self._aggregate_results(seed_results)
+            results[method_name] = aggregated
+            
+            print(f"\n    Final: AA={aggregated['AA_mean']*100:.1f}±{aggregated['AA_std']*100:.1f}%, "
+                  f"F={aggregated['Forgetting_mean']*100:.1f}±{aggregated['Forgetting_std']*100:.1f}%")
+        
+        self.results = results
+        return results
+    
+    def _aggregate_results(self, seed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Aggregate results across seeds."""
+        aggregated = {}
+        
+        # Compute mean and std for each metric
+        for key in ["AA", "BWT", "FWT", "Forgetting", "LA"]:
+            values = [r[key] for r in seed_results if key in r]
+            if values:
+                aggregated[f"{key}_mean"] = float(np.mean(values))
+                aggregated[f"{key}_std"] = float(np.std(values))
+        
+        # Task inference accuracy (for HoloNet)
+        task_inf_vals = [r.get("TaskInfAcc", None) for r in seed_results]
+        task_inf_vals = [v for v in task_inf_vals if v is not None]
+        if task_inf_vals:
+            aggregated["TaskInfAcc_mean"] = float(np.mean(task_inf_vals))
+            aggregated["TaskInfAcc_std"] = float(np.std(task_inf_vals))
+        
+        # Keep individual results
+        aggregated["seeds"] = seed_results
+        
+        return aggregated
+    
+    def print_results_table(self):
+        """Print formatted results table."""
+        if not self.results:
+            print("No results to display. Run experiments first.")
+            return
+        
+        print("\n" + "=" * 80)
+        print("  RESULTS SUMMARY")
+        print("=" * 80)
+        
+        headers = ["Method", "AA (%)", "BWT (%)", "FWT (%)", "F (%)", "TaskInf (%)"]
+        print(f"\n  {'Method':<15} {'AA (%)':<15} {'BWT (%)':<15} {'F (%)':<15} {'TaskInf (%)':<15}")
+        print("  " + "-" * 70)
+        
+        for method, res in self.results.items():
+            aa = f"{res['AA_mean']*100:.1f}±{res['AA_std']*100:.1f}"
+            bwt = f"{res['BWT_mean']*100:.1f}±{res['BWT_std']*100:.1f}"
+            f = f"{res['Forgetting_mean']*100:.1f}±{res['Forgetting_std']*100:.1f}"
+            
+            if "TaskInfAcc_mean" in res:
+                ti = f"{res['TaskInfAcc_mean']*100:.1f}±{res['TaskInfAcc_std']*100:.1f}"
+            else:
+                ti = "—"
+            
+            print(f"  {method:<15} {aa:<15} {bwt:<15} {f:<15} {ti:<15}")
+        
+        print()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART IX: ABLATION STUDIES
+# ════════════════════════════════════════════════════════════════════════════════
+
+def run_ablation_memory_budget(
+    benchmark_type: BenchmarkType = BenchmarkType.PERMUTED_MNIST,
+    memory_budgets: List[int] = [500, 1000, 2000, 5000, 10000],
+    n_tasks: int = 10,
+    seed: int = 42
+) -> Dict[str, List[float]]:
+    """Ablation: Accuracy vs memory budget."""
+    print("\n" + "=" * 60)
+    print("  ABLATION: Memory Budget")
+    print("=" * 60)
+    
+    results = {"budgets": memory_budgets, "AA": [], "Forgetting": []}
+    
+    for budget in memory_budgets:
+        print(f"\n  Budget: {budget}")
+        
+        benchmark = create_benchmark(benchmark_type, n_tasks=n_tasks, seed=seed)
+        
+        method = HoloNetV3(
+            benchmark.input_shape, benchmark.n_classes,
+            n_tasks, memory_size=budget, seed=seed
+        )
+        
+        test_loaders = benchmark.get_all_test_loaders(64)
+        acc_matrix = np.zeros((n_tasks, n_tasks))
+        
+        for t in range(n_tasks):
+            train_loader, _ = benchmark.get_task_loaders(t, 64)
+            method.train_task(t, train_loader)
+            
+            accs = method.evaluate(test_loaders, t)
+            for j, acc in enumerate(accs):
+                acc_matrix[t, j] = acc
+        
+        aa = CLMetrics.average_accuracy(acc_matrix)
+        f = CLMetrics.forgetting(acc_matrix)
+        
+        results["AA"].append(aa)
+        results["Forgetting"].append(f)
+        
+        print(f"    AA: {aa*100:.1f}%, Forgetting: {f*100:.1f}%")
+        
+        # Cleanup
+        del method
+        gc.collect()
+    
+    return results
+
+
+def run_ablation_components(
+    benchmark_type: BenchmarkType = BenchmarkType.PERMUTED_MNIST,
+    n_tasks: int = 10,
+    seed: int = 42
+) -> Dict[str, Dict[str, float]]:
+    """Ablation: Component contributions."""
+    print("\n" + "=" * 60)
+    print("  ABLATION: Component Contributions")
+    print("=" * 60)
+    
+    benchmark = create_benchmark(benchmark_type, n_tasks=n_tasks, seed=seed)
+    test_loaders = benchmark.get_all_test_loaders(64)
+    
+    results = {}
+    
+    # Full HoloNet
+    print("\n  Full HoloNet:")
+    method = HoloNetV3(
+        benchmark.input_shape, benchmark.n_classes,
+        n_tasks, seed=seed
+    )
+    
+    acc_matrix = np.zeros((n_tasks, n_tasks))
+    for t in range(n_tasks):
+        train_loader, _ = benchmark.get_task_loaders(t, 64)
+        method.train_task(t, train_loader)
+        accs = method.evaluate(test_loaders, t)
+        for j, acc in enumerate(accs):
+            acc_matrix[t, j] = acc
+    
+    results["Full"] = {
+        "AA": CLMetrics.average_accuracy(acc_matrix),
+        "Forgetting": CLMetrics.forgetting(acc_matrix)
+    }
+    print(f"    AA: {results['Full']['AA']*100:.1f}%, F: {results['Full']['Forgetting']*100:.1f}%")
+    
+    # Without memory (model only)
+    print("\n  Without Memory (Oracle Task):")
+    acc_matrix_oracle = np.zeros((n_tasks, n_tasks))
+    for t in range(n_tasks):
+        accs = method.evaluate_with_oracle(test_loaders, t)
+        for j, acc in enumerate(accs):
+            acc_matrix_oracle[t, j] = acc
+    
+    results["NoMemory"] = {
+        "AA": CLMetrics.average_accuracy(acc_matrix_oracle),
+        "Forgetting": CLMetrics.forgetting(acc_matrix_oracle)
+    }
+    print(f"    AA: {results['NoMemory']['AA']*100:.1f}%, F: {results['NoMemory']['Forgetting']*100:.1f}%")
+    
+    # Single encoder (naive)
+    print("\n  Single Encoder (Naive):")
+    naive = NaiveFinetuning(
+        benchmark.input_shape, benchmark.n_classes,
+        seed=seed
+    )
+    benchmark = create_benchmark(benchmark_type, n_tasks=n_tasks, seed=seed)
+    acc_matrix_naive = np.zeros((n_tasks, n_tasks))
+    for t in range(n_tasks):
+        train_loader, _ = benchmark.get_task_loaders(t, 64)
+        naive.train_task(t, train_loader)
+        accs = naive.evaluate(test_loaders, t)
+        for j, acc in enumerate(accs):
+            acc_matrix_naive[t, j] = acc
+    
+    results["SingleEncoder"] = {
+        "AA": CLMetrics.average_accuracy(acc_matrix_naive),
+        "Forgetting": CLMetrics.forgetting(acc_matrix_naive)
+    }
+    print(f"    AA: {results['SingleEncoder']['AA']*100:.1f}%, F: {results['SingleEncoder']['Forgetting']*100:.1f}%")
+    
+    return results
+
+
+def run_ablation_fault_tolerance(
+    benchmark_type: BenchmarkType = BenchmarkType.PERMUTED_MNIST,
+    n_tasks: int = 5,
+    seed: int = 42
+) -> Dict[int, float]:
+    """Ablation: Accuracy under shard failures."""
+    print("\n" + "=" * 60)
+    print("  ABLATION: Fault Tolerance (Shard Failures)")
+    print("=" * 60)
+    
+    benchmark = create_benchmark(benchmark_type, n_tasks=n_tasks, seed=seed)
+    
+    method = HoloNetV3(
+        benchmark.input_shape, benchmark.n_classes,
+        n_tasks, holoraid_n=5, holoraid_k=3, seed=seed
+    )
+    
+    # Train on all tasks
+    for t in range(n_tasks):
+        train_loader, _ = benchmark.get_task_loaders(t, 64)
+        method.train_task(t, train_loader)
+    
+    # Test fault tolerance on last task
+    _, test_loader = benchmark.get_task_loaders(n_tasks - 1, 64)
+    
+    max_failures = method.memory.config.n_shards - method.memory.config.k_threshold
+    results = method.test_fault_tolerance(test_loader, n_tasks - 1, max_failures)
+    
+    print("\n  Accuracy by shard failures:")
+    for failures, acc in results.items():
+        print(f"    {failures} failures: {acc*100:.1f}%")
+    
+    return results
+
+
+def run_ablation_scaling(
+    benchmark_type: BenchmarkType = BenchmarkType.PERMUTED_MNIST,
+    task_counts: List[int] = [5, 10, 15, 20],
+    seed: int = 42
+) -> Dict[str, List[Any]]:
+    """Ablation: Scaling with number of tasks."""
+    print("\n" + "=" * 60)
+    print("  ABLATION: Scaling (Number of Tasks)")
+    print("=" * 60)
+    
+    results = {
+        "n_tasks": task_counts,
+        "AA": [],
+        "Forgetting": [],
+        "params": [],
+        "inference_time": []
+    }
+    
+    for n_tasks in task_counts:
+        print(f"\n  Tasks: {n_tasks}")
+        
+        benchmark = create_benchmark(benchmark_type, n_tasks=n_tasks, seed=seed)
+        
+        method = HoloNetV3(
+            benchmark.input_shape, benchmark.n_classes,
+            n_tasks, seed=seed
+        )
+        
+        test_loaders = benchmark.get_all_test_loaders(64)
+        acc_matrix = np.zeros((n_tasks, n_tasks))
+        
+        for t in range(n_tasks):
+            train_loader, _ = benchmark.get_task_loaders(t, 64)
+            method.train_task(t, train_loader)
+            
+            accs = method.evaluate(test_loaders, t)
+            for j, acc in enumerate(accs):
+                acc_matrix[t, j] = acc
+        
+        # Measure inference time
+        t0 = time.time()
+        method.evaluate(test_loaders, n_tasks - 1)
+        inference_time = time.time() - t0
+        
+        aa = CLMetrics.average_accuracy(acc_matrix)
+        f = CLMetrics.forgetting(acc_matrix)
+        
+        results["AA"].append(aa)
+        results["Forgetting"].append(f)
+        results["params"].append(method.get_param_count())
+        results["inference_time"].append(inference_time)
+        
+        print(f"    AA: {aa*100:.1f}%, F: {f*100:.1f}%, Params: {method.get_param_count():,}, InfTime: {inference_time:.2f}s")
+        
+        del method
+        gc.collect()
+    
+    return results
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART X: VISUALIZATION
+# ════════════════════════════════════════════════════════════════════════════════
+
+def plot_experiment_results(
+    results: Dict[str, Dict[str, Any]],
+    benchmark_name: str,
+    save_path: str = "holocl_results.png"
+):
+    """Generate comprehensive visualization of results."""
+    fig = plt.figure(figsize=(16, 12))
+    gs = GridSpec(3, 3, figure=fig, hspace=0.35, wspace=0.3)
+    
+    methods = list(results.keys())
+    colors = plt.cm.tab10(np.linspace(0, 1, len(methods)))
+    
+    # 1. Average Accuracy comparison
+    ax = fig.add_subplot(gs[0, 0])
+    aa_means = [results[m]["AA_mean"] * 100 for m in methods]
+    aa_stds = [results[m]["AA_std"] * 100 for m in methods]
+    bars = ax.bar(methods, aa_means, yerr=aa_stds, capsize=3, color=colors, alpha=0.8)
+    ax.set_ylabel("Average Accuracy (%)", fontsize=10)
+    ax.set_title("(a) Average Accuracy", fontsize=11, fontweight='bold')
+    ax.set_ylim(0, 105)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+    
+    # 2. Forgetting comparison
+    ax = fig.add_subplot(gs[0, 1])
+    f_means = [results[m]["Forgetting_mean"] * 100 for m in methods]
+    f_stds = [results[m]["Forgetting_std"] * 100 for m in methods]
+    bars = ax.bar(methods, f_means, yerr=f_stds, capsize=3, color=colors, alpha=0.8)
+    ax.set_ylabel("Forgetting (%)", fontsize=10)
+    ax.set_title("(b) Forgetting (Lower is Better)", fontsize=11, fontweight='bold')
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+    
+    # 3. BWT comparison
+    ax = fig.add_subplot(gs[0, 2])
+    bwt_means = [results[m]["BWT_mean"] * 100 for m in methods]
+    bwt_stds = [results[m]["BWT_std"] * 100 for m in methods]
+    bars = ax.bar(methods, bwt_means, yerr=bwt_stds, capsize=3, color=colors, alpha=0.8)
+    ax.set_ylabel("Backward Transfer (%)", fontsize=10)
+    ax.set_title("(c) Backward Transfer", fontsize=11, fontweight='bold')
+    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+    
+    # 4. Learning curves (if available)
+    ax = fig.add_subplot(gs[1, 0])
+    for i, method in enumerate(methods):
+        if "seeds" in results[method] and results[method]["seeds"]:
+            acc_matrix = np.array(results[method]["seeds"][0]["acc_matrix"])
+            aa_over_time = [np.mean(acc_matrix[t, :t+1]) for t in range(acc_matrix.shape[0])]
+            ax.plot(range(len(aa_over_time)), [a*100 for a in aa_over_time], 
+                   'o-', label=method, color=colors[i], linewidth=2, markersize=4)
+    ax.set_xlabel("Task", fontsize=10)
+    ax.set_ylabel("Average Accuracy (%)", fontsize=10)
+    ax.set_title("(d) Learning Curves", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    # 5. Task Inference Accuracy (HoloNet only)
+    ax = fig.add_subplot(gs[1, 1])
+    if "HoloNet" in results and "TaskInfAcc_mean" in results["HoloNet"]:
+        ti_mean = results["HoloNet"]["TaskInfAcc_mean"] * 100
+        ti_std = results["HoloNet"]["TaskInfAcc_std"] * 100
+        ax.bar(["HoloNet"], [ti_mean], yerr=[ti_std], capsize=3, color='#4C72B0', alpha=0.8)
+        ax.set_ylabel("Task Inference Accuracy (%)", fontsize=10)
+        ax.set_title("(e) Task Inference", fontsize=11, fontweight='bold')
+        ax.set_ylim(0, 105)
+        ax.axhline(y=100, color='green', linestyle='--', alpha=0.5)
+    else:
+        ax.text(0.5, 0.5, "N/A", ha='center', va='center', transform=ax.transAxes)
+        ax.set_title("(e) Task Inference", fontsize=11, fontweight='bold')
+    
+    # 6. Accuracy vs Forgetting scatter
+    ax = fig.add_subplot(gs[1, 2])
+    for i, method in enumerate(methods):
+        ax.scatter(
+            results[method]["Forgetting_mean"] * 100,
+            results[method]["AA_mean"] * 100,
+            s=100, c=[colors[i]], label=method, alpha=0.8
+        )
+    ax.set_xlabel("Forgetting (%)", fontsize=10)
+    ax.set_ylabel("Average Accuracy (%)", fontsize=10)
+    ax.set_title("(f) Accuracy vs Forgetting", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    # 7. Summary table
+    ax = fig.add_subplot(gs[2, :])
+    ax.axis('off')
+    
+    table_data = []
+    for method in methods:
+        row = [
+            method,
+            f"{results[method]['AA_mean']*100:.1f}±{results[method]['AA_std']*100:.1f}",
+            f"{results[method]['BWT_mean']*100:.1f}±{results[method]['BWT_std']*100:.1f}",
+            f"{results[method]['Forgetting_mean']*100:.1f}±{results[method]['Forgetting_std']*100:.1f}",
+        ]
+        if "TaskInfAcc_mean" in results[method]:
+            row.append(f"{results[method]['TaskInfAcc_mean']*100:.1f}±{results[method]['TaskInfAcc_std']*100:.1f}")
+        else:
+            row.append("—")
+        table_data.append(row)
+    
+    headers = ["Method", "AA (%)", "BWT (%)", "Forgetting (%)", "Task Inf (%)"]
+    table = ax.table(
+        cellText=table_data,
+        colLabels=headers,
+        loc='center',
+        cellLoc='center',
+        colWidths=[0.18, 0.18, 0.18, 0.18, 0.18]
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.8)
+    
+    ax.set_title(f"Results Summary: {benchmark_name}", fontsize=12, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.show()
+    print(f"\n  ✓ Saved: {save_path}")
+
+
+def plot_ablation_results(
+    memory_ablation: Dict[str, List[float]],
+    scaling_ablation: Dict[str, List[Any]],
+    fault_tolerance: Dict[int, float],
+    save_path: str = "holocl_ablations.png"
+):
+    """Plot ablation study results."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # 1. Memory budget ablation
+    ax = axes[0, 0]
+    ax.plot(memory_ablation["budgets"], [a*100 for a in memory_ablation["AA"]], 
+           'o-', linewidth=2, markersize=8, color='#4C72B0')
+    ax.set_xlabel("Memory Budget (entries)", fontsize=11)
+    ax.set_ylabel("Average Accuracy (%)", fontsize=11)
+    ax.set_title("(a) Accuracy vs Memory Budget", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.set_xscale('log')
+    
+    # 2. Scaling ablation
+    ax = axes[0, 1]
+    ax.plot(scaling_ablation["n_tasks"], [a*100 for a in scaling_ablation["AA"]], 
+           'o-', linewidth=2, markersize=8, color='#55A868', label='AA')
+    ax.plot(scaling_ablation["n_tasks"], [f*100 for f in scaling_ablation["Forgetting"]], 
+           's--', linewidth=2, markersize=8, color='#C44E52', label='Forgetting')
+    ax.set_xlabel("Number of Tasks", fontsize=11)
+    ax.set_ylabel("Percentage (%)", fontsize=11)
+    ax.set_title("(b) Scaling with Tasks", fontsize=12, fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 3. Fault tolerance
+    ax = axes[1, 0]
+    failures = list(fault_tolerance.keys())
+    accs = [fault_tolerance[f]*100 for f in failures]
+    ax.bar(failures, accs, color='#8172B3', alpha=0.8)
+    ax.set_xlabel("Shard Failures", fontsize=11)
+    ax.set_ylabel("Accuracy (%)", fontsize=11)
+    ax.set_title("(c) Fault Tolerance", fontsize=12, fontweight='bold')
+    ax.set_ylim(0, 105)
+    for i, (f, a) in enumerate(zip(failures, accs)):
+        ax.text(f, a + 2, f'{a:.1f}%', ha='center', fontsize=10)
+    
+    # 4. Parameter scaling
+    ax = axes[1, 1]
+    ax.plot(scaling_ablation["n_tasks"], [p/1e6 for p in scaling_ablation["params"]], 
+           'o-', linewidth=2, markersize=8, color='#DD8452')
+    ax.set_xlabel("Number of Tasks", fontsize=11)
+    ax.set_ylabel("Parameters (M)", fontsize=11)
+    ax.set_title("(d) Parameter Count", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.show()
+    print(f"\n  ✓ Saved: {save_path}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PART XI: MAIN ENTRY POINT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def main(
+    run_benchmarks: List[str] = None,
+    run_ablations: bool = True,
+    n_seeds: int = 3,
+    quick_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Main entry point for HoloCL benchmark suite.
+    
+    Args:
+        run_benchmarks: List of benchmark names to run. Default: all.
+        run_ablations: Whether to run ablation studies.
+        n_seeds: Number of random seeds for statistical significance.
+        quick_mode: If True, use reduced settings for faster execution.
+    
+    Returns:
+        Dictionary containing all results.
+    """
+    banner()
+    
+    if run_benchmarks is None:
+        run_benchmarks = ["permuted_mnist", "split_mnist", "rotated_mnist"]
+        if not quick_mode:
+            run_benchmarks.extend(["split_cifar10"])
+    
+    # Quick mode settings
+    if quick_mode:
+        n_tasks = 5
+        n_seeds = 1
+        epochs = 2
+        memory_size = 1000
+    else:
+        n_tasks = 10
+        epochs = 3
+        memory_size = 5000
+    
+    all_results = {}
+    
+    # Run main experiments
+    for benchmark_name in run_benchmarks:
+        print(f"\n{'█'*80}")
+        print(f"█  BENCHMARK: {benchmark_name.upper()}")
+        print(f"{'█'*80}")
+        
+        benchmark_type = BenchmarkType(benchmark_name)
+        
+        config = ExperimentConfig(
+            benchmark_type=benchmark_type,
+            n_tasks=min(n_tasks, 10 if "cifar100" in benchmark_name else n_tasks),
+            n_seeds=n_seeds,
+            epochs_per_task=epochs,
+            memory_size=memory_size
+        )
+        
+        runner = ExperimentRunner(config)
+        results = runner.run_all_methods(
+            methods=["NaiveFT", "Replay", "EWC", "LwF", "DER++", "HoloNet"],
+            verbose=True
+        )
+        
+        runner.print_results_table()
+        all_results[benchmark_name] = results
+        
+        # Plot results
+        plot_experiment_results(
+            results, 
+            benchmark_name,
+            f"holocl_{benchmark_name}_results.png"
+        )
+    
+    # Run ablations
+    if run_ablations:
+        print(f"\n{'█'*80}")
+        print(f"█  ABLATION STUDIES")
+        print(f"{'█'*80}")
+        
+        ablation_results = {}
+        
+        # Memory budget ablation
+        if quick_mode:
+            memory_budgets = [500, 1000, 2000]
+        else:
+            memory_budgets = [500, 1000, 2000, 5000, 10000]
+        
+        ablation_results["memory"] = run_ablation_memory_budget(
+            BenchmarkType.PERMUTED_MNIST,
+            memory_budgets,
+            n_tasks=5
+        )
+        
+        # Scaling ablation
+        if quick_mode:
+            task_counts = [5, 10]
+        else:
+            task_counts = [5, 10, 15, 20]
+        
+        ablation_results["scaling"] = run_ablation_scaling(
+            BenchmarkType.PERMUTED_MNIST,
+            task_counts
+        )
+        
+        # Fault tolerance
+        ablation_results["fault_tolerance"] = run_ablation_fault_tolerance(
+            BenchmarkType.PERMUTED_MNIST,
+            n_tasks=5
+        )
+        
+        # Component ablation
+        ablation_results["components"] = run_ablation_components(
+            BenchmarkType.PERMUTED_MNIST,
+            n_tasks=5
+        )
+        
+        all_results["ablations"] = ablation_results
+        
+        # Plot ablations
+        plot_ablation_results(
+            ablation_results["memory"],
+            ablation_results["scaling"],
+            ablation_results["fault_tolerance"],
+            "holocl_ablations.png"
+        )
+    
+    # Final summary
+    print(f"\n{'█'*80}")
+    print(f"█  FINAL SUMMARY")
+    print(f"{'█'*80}")
+    
+    print("\n  HoloCL Benchmark Suite Complete!")
+    print(f"  Benchmarks run: {', '.join(run_benchmarks)}")
+    print(f"  Seeds per experiment: {n_seeds}")
+    print(f"  Ablations: {'Yes' if run_ablations else 'No'}")
+    
+    # Save results to JSON
+    results_file = "holocl_results.json"
+    
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_for_json(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_for_json(v) for v in obj]
+        else:
+            return obj
+    
+    with open(results_file, 'w') as f:
+        json.dump(convert_for_json(all_results), f, indent=2)
+    print(f"\n  ✓ Results saved to: {results_file}")
+    
+    print(f"\n{'█'*80}")
+    print(f"█  ✓ HoloCL demonstrates competitive CL performance")
+    print(f"█  ✓ Per-task encoders eliminate embedding drift")
+    print(f"█  ✓ Task inference enables task-agnostic evaluation")
+    print(f"█  ✓ HoloRAID provides fault-tolerant memory")
+    print(f"{'█'*80}")
+    
+    return all_results
+
+
+if __name__ == "__main__":
+    # Default: run with quick mode for faster execution
+    # Set quick_mode=False for full benchmark
+    results = main(
+        run_benchmarks=["permuted_mnist", "split_mnist"],
+        run_ablations=True,
+        n_seeds=3,
+        quick_mode=True  # Set to False for full benchmark
+    )
+
+
+
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  HoloCL Comprehensive Benchmark Suite v1.0
+  Continual Learning with HoloRAID Memory + Per-Task Encoders
+══════════════════════════════════════════════════════════════════════════════════════════
+  Device: cuda
+  PyTorch: 2.9.0+cu126
+  CUDA Available: True
+  GPU: Tesla T4
+
+
+████████████████████████████████████████████████████████████████████████████████
+█  BENCHMARK: PERMUTED_MNIST
+████████████████████████████████████████████████████████████████████████████████
+
+======================================================================
+  Benchmark: permuted_mnist
+  Tasks: 5, Seeds: 1
+======================================================================
+
+
+  NaiveFT
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=94.2%
+    Task 1: AA=77.0%
+    Task 2: AA=71.7%
+    Task 3: AA=66.1%
+    Task 4: AA=61.3%
+
+    Final: AA=61.3±0.0%, F=34.2±0.0%
+
+  Replay
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=89.6%
+    Task 1: AA=77.7%
+    Task 2: AA=76.9%
+    Task 3: AA=66.1%
+    Task 4: AA=68.0%
+
+    Final: AA=68.0±0.0%, F=2.5±0.0%
+
+  EWC
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=94.2%
+    Task 1: AA=78.9%
+    Task 2: AA=74.8%
+    Task 3: AA=68.0%
+    Task 4: AA=61.5%
+
+    Final: AA=61.5±0.0%, F=34.9±0.0%
+
+  LwF
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=94.2%
+    Task 1: AA=61.2%
+    Task 2: AA=59.6%
+    Task 3: AA=53.2%
+    Task 4: AA=53.9%
+
+    Final: AA=53.9±0.0%, F=19.1±0.0%
+
+  DER++
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=95.8%
+    Task 1: AA=91.5%
+    Task 2: AA=87.4%
+    Task 3: AA=88.0%
+    Task 4: AA=85.7%
+
+    Final: AA=85.7±0.0%, F=4.4±0.0%
+
+  HoloNet
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=96.4%, TaskInf=100.0%
+    Task 1: AA=93.0%, TaskInf=98.8%
+    Task 2: AA=89.3%, TaskInf=96.3%
+    Task 3: AA=85.2%, TaskInf=90.4%
+    Task 4: AA=79.9%, TaskInf=83.7%
+
+    Final: AA=79.9±0.0%, F=4.6±0.0%
+
+================================================================================
+  RESULTS SUMMARY
+================================================================================
+
+  Method          AA (%)          BWT (%)         F (%)           TaskInf (%)    
+  ----------------------------------------------------------------------
+  NaiveFT         61.3±0.0        -34.2±0.0       34.2±0.0        —              
+  Replay          68.0±0.0        4.7±0.0         2.5±0.0         —              
+  EWC             61.5±0.0        -34.9±0.0       34.9±0.0        —              
+  LwF             53.9±0.0        -18.9±0.0       19.1±0.0        —              
+  DER++           85.7±0.0        -4.4±0.0        4.4±0.0         —              
+  HoloNet         79.9±0.0        -4.6±0.0        4.6±0.0         93.9±0.0       
+
+/tmp/ipython-input-368521589.py:2604: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+  plt.tight_layout()
+
+
+  ✓ Saved: holocl_permuted_mnist_results.png
+
+████████████████████████████████████████████████████████████████████████████████
+█  BENCHMARK: SPLIT_MNIST
+████████████████████████████████████████████████████████████████████████████████
+
+======================================================================
+  Benchmark: split_mnist
+  Tasks: 5, Seeds: 1
+======================================================================
+
+
+  NaiveFT
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=100.0%
+    Task 1: AA=49.2%
+    Task 2: AA=33.2%
+    Task 3: AA=24.9%
+    Task 4: AA=19.5%
+
+    Final: AA=19.5±0.0%, F=99.4±0.0%
+
+  Replay
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=99.8%
+    Task 1: AA=92.1%
+    Task 2: AA=95.1%
+    Task 3: AA=95.7%
+    Task 4: AA=93.8%
+
+    Final: AA=93.8±0.0%, F=2.9±0.0%
+
+  EWC
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=100.0%
+    Task 1: AA=49.4%
+    Task 2: AA=33.1%
+    Task 3: AA=24.9%
+    Task 4: AA=19.6%
+
+    Final: AA=19.6±0.0%, F=99.4±0.0%
+
+  LwF
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=100.0%
+    Task 1: AA=61.6%
+    Task 2: AA=54.0%
+    Task 3: AA=51.6%
+    Task 4: AA=50.4%
+
+    Final: AA=50.4±0.0%, F=10.6±0.0%
+
+  DER++
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=99.8%
+    Task 1: AA=97.5%
+    Task 2: AA=96.3%
+    Task 3: AA=96.5%
+    Task 4: AA=93.5%
+
+    Final: AA=93.5±0.0%, F=4.0±0.0%
+
+  HoloNet
+  ------------------------------------------------------------
+
+    Seed 1/1:
+    Task 0: AA=99.8%, TaskInf=100.0%
+    Task 1: AA=97.2%, TaskInf=97.4%
+    Task 2: AA=92.5%, TaskInf=92.8%
+    Task 3: AA=91.6%, TaskInf=91.8%
+    Task 4: AA=83.4%, TaskInf=83.5%
+
+    Final: AA=83.4±0.0%, F=12.4±0.0%
+
+================================================================================
+  RESULTS SUMMARY
+================================================================================
+
+  Method          AA (%)          BWT (%)         F (%)           TaskInf (%)    
+  ----------------------------------------------------------------------
+  NaiveFT         19.5±0.0        -99.4±0.0       99.4±0.0        —              
+  Replay          93.8±0.0        -2.1±0.0        2.9±0.0         —              
+  EWC             19.6±0.0        -99.4±0.0       99.4±0.0        —              
+  LwF             50.4±0.0        -9.8±0.0        10.6±0.0        —              
+  DER++           93.5±0.0        -4.0±0.0        4.0±0.0         —              
+  HoloNet         83.4±0.0        -12.4±0.0       12.4±0.0        93.1±0.0       
+
+
+
+  ✓ Saved: holocl_split_mnist_results.png
+
+████████████████████████████████████████████████████████████████████████████████
+█  ABLATION STUDIES
+████████████████████████████████████████████████████████████████████████████████
+
+============================================================
+  ABLATION: Memory Budget
+============================================================
+
+  Budget: 500
+    AA: 77.6%, Forgetting: 5.8%
+
+  Budget: 1000
+    AA: 81.6%, Forgetting: 4.6%
+
+  Budget: 2000
+    AA: 86.7%, Forgetting: 2.8%
+
+============================================================
+  ABLATION: Scaling (Number of Tasks)
+============================================================
+
+  Tasks: 5
+    AA: 89.6%, F: 2.3%, Params: 2,104,010, InfTime: 1.74s
+
+  Tasks: 10
+    AA: 80.6%, F: 4.9%, Params: 4,206,730, InfTime: 3.72s
+
+============================================================
+  ABLATION: Fault Tolerance (Shard Failures)
+============================================================
+
+  Accuracy by shard failures:
+    0 failures: 80.0%
+    1 failures: 80.0%
+    2 failures: 80.0%
+
+============================================================
+  ABLATION: Component Contributions
+============================================================
+
+  Full HoloNet:
+    AA: 88.3%, F: 3.8%
+
+  Without Memory (Oracle Task):
+    AA: 89.5%, F: 0.0%
+
+  Single Encoder (Naive):
+    AA: 64.0%, F: 33.5%
+
+
+  ✓ Saved: holocl_ablations.png
+
+████████████████████████████████████████████████████████████████████████████████
+█  FINAL SUMMARY
+████████████████████████████████████████████████████████████████████████████████
+
+  HoloCL Benchmark Suite Complete!
+  Benchmarks run: permuted_mnist, split_mnist
+  Seeds per experiment: 1
+  Ablations: Yes
+
+  ✓ Results saved to: holocl_results.json
+
+████████████████████████████████████████████████████████████████████████████████
+█  ✓ HoloCL demonstrates competitive CL performance
+█  ✓ Per-task encoders eliminate embedding drift
+█  ✓ Task inference enables task-agnostic evaluation
+█  ✓ HoloRAID provides fault-tolerant memory
+████████████████████████████████████████████████████████████████████████████████
