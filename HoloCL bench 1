@@ -1,3 +1,5 @@
+How about now?
+
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════════════════╗
@@ -2841,9 +2843,6 @@ if __name__ == "__main__":
     )
 
 
-
-
-
 ══════════════════════════════════════════════════════════════════════════════════════════
   HoloCL Comprehensive Benchmark Suite v1.0
   Continual Learning with HoloRAID Memory + Per-Task Encoders
@@ -2866,7 +2865,10 @@ if __name__ == "__main__":
 
   NaiveFT
   ------------------------------------------------------------
-
+100%|██████████| 9.91M/9.91M [00:00<00:00, 58.5MB/s]
+100%|██████████| 28.9k/28.9k [00:00<00:00, 1.67MB/s]
+100%|██████████| 1.65M/1.65M [00:00<00:00, 15.4MB/s]
+100%|██████████| 4.54k/4.54k [00:00<00:00, 14.1MB/s]
     Seed 1/1:
     Task 0: AA=94.2%
     Task 1: AA=77.0%
@@ -2951,8 +2953,7 @@ if __name__ == "__main__":
 
 /tmp/ipython-input-368521589.py:2604: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
   plt.tight_layout()
-
-
+￼
   ✓ Saved: holocl_permuted_mnist_results.png
 
 ████████████████████████████████████████████████████████████████████████████████
@@ -3050,8 +3051,7 @@ if __name__ == "__main__":
   DER++           93.5±0.0        -4.0±0.0        4.0±0.0         —              
   HoloNet         83.4±0.0        -12.4±0.0       12.4±0.0        93.1±0.0       
 
-
-
+￼
   ✓ Saved: holocl_split_mnist_results.png
 
 ████████████████████████████████████████████████████████████████████████████████
@@ -3076,10 +3076,10 @@ if __name__ == "__main__":
 ============================================================
 
   Tasks: 5
-    AA: 89.6%, F: 2.3%, Params: 2,104,010, InfTime: 1.74s
+    AA: 89.6%, F: 2.3%, Params: 2,104,010, InfTime: 1.72s
 
   Tasks: 10
-    AA: 80.6%, F: 4.9%, Params: 4,206,730, InfTime: 3.72s
+    AA: 80.6%, F: 4.9%, Params: 4,206,730, InfTime: 3.82s
 
 ============================================================
   ABLATION: Fault Tolerance (Shard Failures)
@@ -3102,8 +3102,7 @@ if __name__ == "__main__":
 
   Single Encoder (Naive):
     AA: 64.0%, F: 33.5%
-
-
+￼
   ✓ Saved: holocl_ablations.png
 
 ████████████████████████████████████████████████████████████████████████████████
